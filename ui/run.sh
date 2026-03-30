@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the Unsloth Pipeline UI
+# Launch the Pipeline UI (FastAPI + WebSocket log streaming)
 #
 # Usage: ./run.sh [port]
 
@@ -8,7 +8,7 @@ VENV="${SCRIPT_DIR}/../unsloth-env/bin"
 
 # Fallback to root-level venv
 if [ ! -f "$VENV/uvicorn" ]; then
-    VENV="/server/programming/unsloth-env/bin"
+    VENV="/server/programming/pipeline/unsloth-env/bin"
 fi
 
 PORT="${1:-7865}"
@@ -18,5 +18,5 @@ export PYTORCH_HIP_ALLOC_CONF="backend:native,expandable_segments:True"
 export UNSLOTH_SKIP_TORCHVISION_CHECK=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-echo "Starting Unsloth Pipeline UI on http://localhost:${PORT}"
+echo "Starting Pipeline UI on http://localhost:${PORT}"
 exec "$VENV/uvicorn" app:app --host 0.0.0.0 --port "$PORT" --app-dir "$SCRIPT_DIR"

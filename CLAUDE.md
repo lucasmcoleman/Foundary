@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What This Is
 
 LLM fine-tuning and hybrid quantization pipeline for AMD ROCm (Strix Halo APU, gfx1151). Three core components:
-- **Unsloth QLoRA training** with completion-only loss masking
+- **Custom fast QLoRA training** with shard-by-shard BnB quantization and completion-only loss masking (replaces Unsloth)
 - **MagicQuant** evolutionary per-tensor hybrid quantization
 - **FastAPI Web UI** for pipeline orchestration
 
@@ -45,16 +45,16 @@ python patch_gguf_metadata.py
 This system runs on a Strix Halo APU where GPU and CPU share 124 GB of system RAM. Key implications:
 
 - **Unsloth/transformers model loading is extremely slow** on this hardware. The default `from_pretrained` path loads tensors one at a time through Python's GIL. For 40B+ models this takes hours.
-- **Use the custom fast loaders instead**: `fast_train_zeroclaw.py` loads safetensors shard-by-shard with inline BnB 4-bit quantization (~2 min vs hours). `fast_export.py` does streaming LoRA merge at ~6 GB peak memory.
-- **BitsAndBytes 0.49.2 works on ROCm** — GPU quantization kernels are functional (0.011s/tensor). Unsloth auto-disables BnB on AMD for versions < 0.48.2 but 0.49.2 passes the check.
+- **The pipeline now uses custom fast loaders instead of Unsloth**: `fast_train_zeroclaw.py` loads safetensors shard-by-shard with inline BnB 4-bit quantization (~2 min vs hours). `fast_export.py` does streaming LoRA merge at ~6 GB peak memory. Both `pipeline.py` stage_training() and stage_export() call these fast loaders.
+- **BitsAndBytes 0.49.2 works on ROCm** — GPU quantization kernels are functional (0.011s/tensor).
 - **BnB requires blocksize=128** on AMD (not the NVIDIA default of 64).
 - **LM Studio models consume GPU memory from the same pool** — unload them before training.
 
 ## Architecture
 
 ### Pipeline Stages (pipeline.py)
-1. **Training**: Unsloth QLoRA with completion-only loss (masks system/user turns)
-2. **Export**: Merge LoRA → safetensors (if MagicQuant enabled) or direct GGUF
+1. **Training**: Custom fast QLoRA with completion-only loss (masks system/user turns)
+2. **Export**: Streaming shard-by-shard LoRA merge to safetensors (~6 GB peak)
 3. **MagicQuant**: Evolutionary search → 3-tier hybrid GGUFs (Q4/Q5/Q6)
 4. **Upload**: HuggingFace Hub with model card generation
 
@@ -64,11 +64,12 @@ Classifies tensors into sensitivity groups (E=Embeddings, H=Head, Q=Query, K=Key
 **GGUF writer** (`gguf/writer.py`): Two-pass streaming — header pass computes sizes/offsets, data pass overlaps I/O with encoding. Has block-size compatibility check for hybrid architectures (Mamba layers with non-standard dimensions fall back to BF16).
 
 ### Fast Loaders (for 40B+ models on unified memory)
-- `fast_train_zeroclaw.py`: Creates model on meta device, loads safetensors shard-by-shard, replaces nn.Linear with bnb.nn.Linear4bit, quantizes inline per-shard, frees each shard before next. Peak ~30 GB for a 40B model.
-- `fast_export.py`: Streams LoRA merge shard-by-shard — loads shard, applies LoRA deltas (W + scaling * B @ A), saves merged shard, frees. Peak ~6 GB.
+- `fast_train_zeroclaw.py`: Creates model on meta device, loads safetensors shard-by-shard, replaces nn.Linear with bnb.nn.Linear4bit, quantizes inline per-shard, frees each shard before next. Includes completion-only loss masking and checkpoint resume. Peak ~30 GB for a 40B model.
+- `fast_export.py`: Streams LoRA merge shard-by-shard on GPU — loads shard, applies LoRA deltas (W + scaling * B @ A) on GPU, saves merged shard, frees. Peak ~6 GB.
+- `train.py`, `train_zeroclaw.py`: LEGACY scripts that use Unsloth. Kept for reference/NVIDIA use.
 
 ### Web UI (ui/)
-FastAPI + WebSocket live log streaming. Pydantic config models. Port 7865 (configurable via UNSLOTH_UI_PORT).
+FastAPI + WebSocket live log streaming. Pydantic config models. Port 7865 (configurable via PIPELINE_UI_PORT).
 
 ## Dataset Format
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Unsloth Pipeline</title>
+<title>MagicQuant Pipeline</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -40,6 +40,16 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 .btn-primary { background: var(--amber); color: var(--bg-0); border-color: var(--amber); }
 .btn-primary:hover { background: #d97706; border-color: #d97706; }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-danger { background: var(--red-dim); color: var(--red); border-color: var(--red-dim); }
+.btn-danger:hover { background: #991b1b; border-color: var(--red); }
+
+.status-banner { display: none; align-items: center; gap: 10px; padding: 10px 16px; margin: 0 32px 16px; border-radius: var(--radius); font-size: 12px; line-height: 1.5; }
+.status-banner.visible { display: flex; }
+.status-banner.error { background: rgba(239,68,68,0.1); border: 1px solid var(--red-dim); color: var(--red); }
+.status-banner.success { background: rgba(34,197,94,0.1); border: 1px solid var(--green-dim); color: var(--green); }
+.status-banner.warn { background: rgba(245,158,11,0.08); border: 1px solid var(--amber-dim); color: var(--amber); }
+.status-banner .dismiss { margin-left: auto; cursor: pointer; opacity: 0.6; font-size: 14px; }
+.status-banner .dismiss:hover { opacity: 1; }
 
 .sidebar { grid-area: sidebar; background: var(--bg-1); padding: 20px 0; overflow-y: auto; display: flex; flex-direction: column; }
 .sidebar-title { font-size: 10px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-3); padding: 0 20px; margin-bottom: 16px; }
@@ -163,8 +173,8 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 <div class="app">
   <header class="header">
     <div class="header-left">
-      <div class="logo"><span>&#x1F9A5;</span> Unsloth Pipeline</div>
-      <div class="header-tag">QLoRA</div>
+      <div class="logo"><span>&#x2728;</span> MagicQuant Pipeline</div>
+      <div class="header-tag">QLoRA + GGUF</div>
     </div>
     <div class="header-right">
       <div class="gpu-badge"><div class="dot"></div><span id="gpu-name">Radeon 8060S &middot; 112GB GTT</span></div>
@@ -179,6 +189,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <span class="settings-saved" id="settings-saved">Saved</span>
         </div>
       </div>
+      <button class="btn btn-danger" id="btn-stop" onclick="stopPipeline()" style="display:none">Stop</button>
       <button class="btn btn-primary" id="btn-run" onclick="runPipeline()">Run Pipeline</button>
     </div>
   </header>
@@ -221,7 +232,13 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
     </div>
   </aside>
 
-  <main class="main" id="main-content"></main>
+  <main class="main" id="main-content">
+    <div class="status-banner" id="status-banner">
+      <span id="status-banner-text"></span>
+      <span class="dismiss" onclick="dismissStatus()">&times;</span>
+    </div>
+    <div id="stage-content"></div>
+  </main>
 
   <div class="logs">
     <div class="logs-header">
@@ -236,6 +253,8 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 </div>
 
 <script>
+// ── Application State ──────────────────────────────────────────────────────
+/** @type {{ selectedStage: string, enabledStages: Set<string>, running: boolean, autoScroll: boolean, ws: WebSocket|null, config: Object, mqTiers: string[], hfUsername: string }} */
 const S = {
   selectedStage: 'training',
   enabledStages: new Set(['training', 'export']),
@@ -259,8 +278,63 @@ const S = {
   hfUsername: '',
 };
 
-// Persistent config
+// ── localStorage Form Persistence ──────────────────────────────────────────
+const LS_KEY = 'pipeline_form_state';
+
+/**
+ * Save the current form config and enabled stages to localStorage.
+ * Called on every form input change.
+ */
+function saveFormState() {
+  try {
+    const data = {
+      config: S.config,
+      enabledStages: Array.from(S.enabledStages),
+      selectedStage: S.selectedStage,
+    };
+    localStorage.setItem(LS_KEY, JSON.stringify(data));
+  } catch(e) { /* localStorage may be unavailable */ }
+}
+
+/**
+ * Restore form config and enabled stages from localStorage on page load.
+ * Falls back to defaults if nothing is saved or data is corrupt.
+ */
+function restoreFormState() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (data.config) {
+      // Deep-merge each section to preserve new defaults for keys not in stored data
+      for (const section of Object.keys(S.config)) {
+        if (data.config[section]) {
+          Object.assign(S.config[section], data.config[section]);
+        }
+      }
+    }
+    if (data.enabledStages) {
+      S.enabledStages = new Set(data.enabledStages);
+      // Sync sidebar toggles
+      document.querySelectorAll('.stage-item .stage-toggle input').forEach(input => {
+        const stage = input.closest('.stage-item')?.dataset.stage;
+        if (stage) input.checked = S.enabledStages.has(stage);
+      });
+    }
+    if (data.selectedStage) {
+      S.selectedStage = data.selectedStage;
+      document.querySelectorAll('.stage-item').forEach(el =>
+        el.classList.toggle('active', el.dataset.stage === S.selectedStage));
+    }
+  } catch(e) { /* corrupt data, ignore */ }
+}
+
+// ── Server-side Config (HF username, etc.) ─────────────────────────────────
 let _saveTimer = null;
+
+/**
+ * Load server-persisted config (e.g. HF username) from /api/config.
+ */
 async function loadConfig() {
   try {
     const r = await fetch('/api/config');
@@ -268,8 +342,13 @@ async function loadConfig() {
     S.hfUsername = cfg.hf_username || '';
     const el = document.getElementById('cfg-hf-username');
     if (el) el.value = S.hfUsername;
-  } catch(e) {}
+  } catch(e) { /* server may not be ready yet */ }
 }
+
+/**
+ * Save server-persisted config (HF username) to /api/config.
+ * Shows a brief "Saved" indicator in the settings popover.
+ */
 async function saveConfig() {
   const el = document.getElementById('cfg-hf-username');
   S.hfUsername = (el?.value || '').trim();
@@ -277,9 +356,13 @@ async function saveConfig() {
     await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({hf_username: S.hfUsername})});
     const saved = document.getElementById('settings-saved');
     if (saved) { saved.classList.add('show'); setTimeout(() => saved.classList.remove('show'), 1500); }
-  } catch(e) {}
+  } catch(e) { /* silent */ }
 }
+
+/** Debounce wrapper for saveConfig -- waits 600ms after last keystroke. */
 function saveConfigDebounced() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveConfig, 600); }
+
+/** Toggle the settings popover open/closed. */
 function toggleSettings() {
   const pop = document.getElementById('settings-pop');
   pop.classList.toggle('open');
@@ -287,6 +370,8 @@ function toggleSettings() {
     document.addEventListener('click', closeSettingsOutside);
   }
 }
+
+/** Close settings popover when clicking outside of it. */
 function closeSettingsOutside(e) {
   const wrap = document.querySelector('.settings-wrap');
   if (!wrap.contains(e.target)) {
@@ -294,48 +379,153 @@ function closeSettingsOutside(e) {
     document.removeEventListener('click', closeSettingsOutside);
   }
 }
-loadConfig();
 
-// WebSocket
+// ── Status Banner ──────────────────────────────────────────────────────────
+
+/**
+ * Show a status banner at the top of the main content area.
+ * @param {string} text - Message to display
+ * @param {'error'|'success'|'warn'} level - Visual style
+ */
+function showStatus(text, level) {
+  const banner = document.getElementById('status-banner');
+  const textEl = document.getElementById('status-banner-text');
+  if (!banner || !textEl) return;
+  textEl.textContent = text;
+  banner.className = 'status-banner visible ' + level;
+}
+
+/** Dismiss (hide) the status banner. */
+function dismissStatus() {
+  const banner = document.getElementById('status-banner');
+  if (banner) banner.className = 'status-banner';
+}
+
+// ── WebSocket (real-time log streaming) ────────────────────────────────────
+
+/**
+ * Establish a WebSocket connection to /ws for real-time log streaming.
+ * Handles log lines, stage updates, progress updates, and pipeline completion.
+ * Automatically reconnects on close after a 2-second delay.
+ */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   S.ws = new WebSocket(`${proto}//${location.host}/ws`);
   S.ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
-    if (m.type === 'log') appendLog(m.text, m.level);
-    else if (m.type === 'stage_update') { document.querySelector(`[data-stage="${m.stage}"]`).dataset.status = m.status; const p=document.querySelector('.progress-container'); if(p&&m.status==='running'){p.classList.add('visible'); const l=p.querySelector('.progress-stage'); if(l) l.textContent=m.stage.charAt(0).toUpperCase()+m.stage.slice(1);} }
-    else if (m.type === 'progress') { const f=document.querySelector('.progress-fill'),l=document.querySelector('.progress-pct'); if(f)f.style.width=m.percent+'%'; if(l)l.textContent=m.percent+'%'; }
-    else if (m.type === 'pipeline_done') { S.running=false; const b=document.getElementById('btn-run'); b.disabled=false; b.textContent='Run Pipeline'; }
+    if (m.type === 'log') {
+      appendLog(m.text, m.level);
+      // Surface errors in the status banner
+      if (m.level === 'error') showStatus(m.text, 'error');
+    } else if (m.type === 'stage_update') {
+      const stageEl = document.querySelector(`[data-stage="${m.stage}"]`);
+      if (stageEl) stageEl.dataset.status = m.status;
+      const p = document.querySelector('.progress-container');
+      if (p && m.status === 'running') {
+        p.classList.add('visible');
+        const l = p.querySelector('.progress-stage');
+        if (l) l.textContent = m.stage.charAt(0).toUpperCase() + m.stage.slice(1);
+      }
+      if (m.status === 'failed') {
+        showStatus(`Stage "${m.stage}" failed -- see logs for details`, 'error');
+      }
+    } else if (m.type === 'progress') {
+      const f = document.querySelector('.progress-fill');
+      const l = document.querySelector('.progress-pct');
+      if (f) f.style.width = m.percent + '%';
+      if (l) l.textContent = m.percent + '%';
+    } else if (m.type === 'pipeline_done') {
+      setPipelineRunning(false);
+      // Check if all stages completed
+      const allDone = document.querySelectorAll('.stage-item[data-status="failed"]').length === 0;
+      if (allDone) showStatus('Pipeline complete', 'success');
+    }
   };
   S.ws.onclose = () => setTimeout(connectWS, 2000);
 }
-connectWS();
 
+// ── UI Button State ────────────────────────────────────────────────────────
+
+/**
+ * Update Run/Stop button visibility and pipeline running state.
+ * @param {boolean} running - Whether the pipeline is currently running
+ */
+function setPipelineRunning(running) {
+  S.running = running;
+  const btnRun = document.getElementById('btn-run');
+  const btnStop = document.getElementById('btn-stop');
+  btnRun.disabled = running;
+  btnRun.textContent = running ? 'Running...' : 'Run Pipeline';
+  btnStop.style.display = running ? 'inline-block' : 'none';
+}
+
+// ── Stage Navigation ───────────────────────────────────────────────────────
+
+/**
+ * Select a pipeline stage in the sidebar and render its configuration panel.
+ * @param {string} name - Stage name ('training', 'export', 'magicquant', 'upload')
+ */
 function selectStage(name) {
   S.selectedStage = name;
-  document.querySelectorAll('.stage-item').forEach(el => el.classList.toggle('active', el.dataset.stage===name));
+  document.querySelectorAll('.stage-item').forEach(el => el.classList.toggle('active', el.dataset.stage === name));
   renderStageContent();
+  saveFormState();
 }
 
+/**
+ * Enable or disable a pipeline stage from sidebar toggles.
+ * @param {string} name - Stage name
+ * @param {boolean} on - Whether to enable
+ */
 function toggleStage(name, on) {
   on ? S.enabledStages.add(name) : S.enabledStages.delete(name);
-  // Always re-render: toggling one stage can affect dependency banners on other stages
   renderStageContent();
+  saveFormState();
 }
 
+/**
+ * Render the configuration panel for the currently selected stage.
+ * Binds data-key inputs to S.config and persists changes to localStorage.
+ */
 function renderStageContent() {
   const r = {training: renderTraining, export: renderExport, magicquant: renderMagicQuant, upload: renderUpload};
-  document.getElementById('main-content').innerHTML = (r[S.selectedStage] || (()=>''))();
+  const container = document.getElementById('stage-content');
+  if (!container) return;
+  container.innerHTML = (r[S.selectedStage] || (() => ''))();
+  // Bind all data-key inputs to the config object
   document.querySelectorAll('[data-key]').forEach(input => {
     input.addEventListener('change', () => {
       const [sec, key] = input.dataset.key.split('.');
-      S.config[sec][key] = input.type==='checkbox' ? input.checked : input.type==='number' ? parseFloat(input.value) : input.value;
+      S.config[sec][key] = input.type === 'checkbox' ? input.checked : input.type === 'number' ? parseFloat(input.value) : input.value;
+      saveFormState();
     });
+    // Also persist on typing, not just on blur/change
+    if (input.type !== 'checkbox') {
+      input.addEventListener('input', () => {
+        const [sec, key] = input.dataset.key.split('.');
+        S.config[sec][key] = input.type === 'number' ? parseFloat(input.value) : input.value;
+        saveFormState();
+      });
+    }
   });
 }
 
+// ── HTML Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Generate a form label with a tooltip.
+ * @param {string} label - Label text
+ * @param {string} tip - Tooltip text shown on hover
+ * @returns {string} HTML string for the label element
+ */
 function L(label, tip) { return `<label class="form-label" data-tip="${tip}">${label}</label>`; }
 
+/**
+ * Render a master enable/disable toggle for a pipeline stage.
+ * @param {string} stage - Stage name
+ * @param {string} label - Human-readable label
+ * @returns {string} HTML string
+ */
 function masterToggle(stage, label) {
   const on = S.enabledStages.has(stage);
   return `<div class="stage-master-toggle">
@@ -347,16 +537,26 @@ function masterToggle(stage, label) {
   </div>`;
 }
 
+/**
+ * Render a dependency/info banner (warning or informational).
+ * @param {'warn'|'info'} type - Banner style
+ * @param {string} html - Inner HTML content
+ * @returns {string} HTML string
+ */
 function depBanner(type, html) {
   const icon = type === 'warn' ? '\u26a0' : '\u2139';
   return `<div class="dep-banner dep-banner-${type}"><span class="dep-icon">${icon}</span><div>${html}</div></div>`;
 }
 
+/**
+ * Auto-generate a HuggingFace repo ID based on the model name and enabled stages.
+ * Uses the HF username from settings if available.
+ * @returns {string} Suggested repo ID (e.g. "user/ModelName-MagicQuant-GGUF")
+ */
 function suggestRepoId() {
   const trainingOn = S.enabledStages.has('training');
   const exportOn = S.enabledStages.has('export');
   const hasMQ = S.enabledStages.has('magicquant');
-  // Derive model name from the first enabled stage that has one
   let modelName = '';
   if (trainingOn) {
     modelName = S.config.training.model_name;
@@ -367,7 +567,6 @@ function suggestRepoId() {
   } else {
     modelName = S.config.training.model_name;
   }
-  // Strip path/org prefix and any file extension
   let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
   short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
   const suffix = hasMQ ? '-MagicQuant-GGUF' : exportOn ? '-GGUF' : '-LoRA';
@@ -375,14 +574,22 @@ function suggestRepoId() {
   return prefix + short + suffix;
 }
 
+/**
+ * Toggle a stage from the master toggle inside the config panel.
+ * Syncs the sidebar toggle checkbox.
+ * @param {string} stage - Stage name
+ * @param {boolean} on - Whether to enable
+ */
 function masterToggleStage(stage, on) {
   toggleStage(stage, on);
-  // Sync the sidebar toggle
   const sidebarToggle = document.querySelector(`.stage-item[data-stage="${stage}"] .stage-toggle input`);
   if (sidebarToggle) sidebarToggle.checked = on;
   renderStageContent();
 }
 
+// ── Stage Renderers ────────────────────────────────────────────────────────
+
+/** @returns {string} HTML for the Training configuration panel. */
 function renderTraining() {
   const c = S.config.training;
   const on = S.enabledStages.has('training');
@@ -392,7 +599,7 @@ function renderTraining() {
   <div class="${on?'':'stage-content-disabled'}">
   <div class="form-grid">
     <div class="form-section-label">Model</div>
-    <div class="form-group span-2">${L('Model Name / HuggingFace ID','HuggingFace model repo (e.g. unsloth/Qwen3-8B) or local path to a model directory')}<input class="form-input" data-key="training.model_name" value="${c.model_name}"></div>
+    <div class="form-group span-2">${L('Model Name / HuggingFace ID','HuggingFace model repo (e.g. Qwen/Qwen3-8B) or local path to a model directory')}<input class="form-input" data-key="training.model_name" value="${c.model_name}"></div>
     <div class="form-group span-2">${L('Dataset Path','Path to a JSONL file where each line has a &quot;messages&quot; array in chat format. Validated before training starts.')}<input class="form-input" data-key="training.dataset_path" value="${c.dataset_path}"></div>
     <div class="form-group">${L('Max Sequence Length','Maximum number of tokens per training example. Longer sequences use more VRAM. 4096 is a good default.')}<input class="form-input" type="number" data-key="training.max_seq_length" value="${c.max_seq_length}"></div>
     <div class="form-group">${L('Output Directory','Where to save LoRA adapters, checkpoints, and all pipeline artifacts')}<input class="form-input" data-key="training.output_dir" value="${c.output_dir}"></div>
@@ -411,11 +618,12 @@ function renderTraining() {
     <div class="form-group">${L('Warmup Ratio','Fraction of training spent linearly increasing LR from 0. Prevents early instability. 0.03-0.1 typical.')}<input class="form-input" type="number" step="0.01" data-key="training.warmup_ratio" value="${c.warmup_ratio}"></div>
     <div class="form-group">${L('Optimizer','Weight update algorithm. adamw_8bit uses 8-bit Adam to save VRAM with negligible quality difference.')}<input class="form-input" data-key="training.optim" value="${c.optim}"></div>
   </div>
-  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);">Completion-only loss enabled — only assistant responses are trained on. System prompts and user messages are masked.</div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:11px;color:var(--text-2);">Completion-only loss enabled -- only assistant responses are trained on. System prompts and user messages are masked.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Training</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
 
+/** @returns {string} HTML for the Export (GGUF) configuration panel. */
 function renderExport() {
   const c = S.config.export;
   const on = S.enabledStages.has('export');
@@ -425,10 +633,10 @@ function renderExport() {
   <div class="section-header"><div class="section-title">Export to GGUF</div><div class="section-badge badge-optional">Optional</div></div>
   ${masterToggle('export', 'Export Stage')}
   <div class="${on?'':'stage-content-disabled'}">
-  ${needsSource ? depBanner('warn', 'Training is disabled. Provide a source model below — a HuggingFace ID or local path to a model or LoRA adapter directory.') : ''}
-  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">${needsSource ? 'Loads the source model and converts directly to GGUF.' : 'Merges LoRA adapters into the base model and converts directly to GGUF in a single step — no intermediate safetensors written to disk (unless opted in below).'}</div>
+  ${needsSource ? depBanner('warn', 'Training is disabled. Provide a source model below -- a HuggingFace ID or local path to a model or LoRA adapter directory.') : ''}
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">${needsSource ? 'Loads the source model and converts directly to GGUF.' : 'Merges LoRA adapters into the base model and converts directly to GGUF in a single step -- no intermediate safetensors written to disk (unless opted in below).'}</div>
   <div class="form-grid">
-    ${needsSource ? `<div class="form-group span-2">${L('Source Model','HuggingFace model ID (e.g. unsloth/Qwen3-8B) or local path to a model directory or LoRA adapter directory. Required when Training is disabled.')}<input class="form-input" data-key="export.source_model" value="${c.source_model}" placeholder="${S.config.training.model_name}" style="border-color:${c.source_model?'var(--border)':'var(--amber-dim)'}"></div>` : ''}
+    ${needsSource ? `<div class="form-group span-2">${L('Source Model','HuggingFace model ID (e.g. Qwen/Qwen3-8B) or local path to a model directory or LoRA adapter directory. Required when Training is disabled.')}<input class="form-input" data-key="export.source_model" value="${c.source_model}" placeholder="${S.config.training.model_name}" style="border-color:${c.source_model?'var(--border)':'var(--amber-dim)'}"></div>` : ''}
     <div class="form-group">${L('GGUF Type','Output precision for the GGUF file. bf16 retains full quality and is the required input for MagicQuant. f16 and q8_0 are smaller but lossy.')}<input class="form-input" data-key="export.gguf_type" value="${c.gguf_type}"></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="export.also_save_merged" ${c.also_save_merged?'checked':''}><span class="form-label" data-tip="Save a copy of the merged model in HuggingFace safetensors format. Useful if you want to upload the full-precision model or use it with other tools." style="margin:0">Also save merged HF safetensors</span></label></div>
   </div>
@@ -436,6 +644,7 @@ function renderExport() {
   </div>`;
 }
 
+/** @returns {string} HTML for the MagicQuant configuration panel. */
 function renderMagicQuant() {
   const c = S.config.magicquant;
   const sel = new Set(c.tiers);
@@ -463,6 +672,7 @@ function renderMagicQuant() {
   </div>`;
 }
 
+/** @returns {string} HTML for the HuggingFace Upload configuration panel. */
 function renderUpload() {
   const c = S.config.upload;
   const on = S.enabledStages.has('upload');
@@ -470,7 +680,6 @@ function renderUpload() {
   const trainingOn = S.enabledStages.has('training');
   const exportOn = S.enabledStages.has('export');
   const mqOn = S.enabledStages.has('magicquant');
-  // Warn about what artifacts will be available
   let uploadHints = [];
   if (!trainingOn) uploadHints.push('No LoRA adapters (training disabled)');
   if (!exportOn && !mqOn) uploadHints.push('No GGUF files (export &amp; MagicQuant disabled)');
@@ -481,7 +690,7 @@ function renderUpload() {
   ${uploadHints.length ? depBanner('info', uploadHints.join('<br>') + '<br>Make sure the output directory contains artifacts from a previous run, or enable the upstream stages.') : ''}
   <div class="form-grid">
     <div class="form-group span-2">${L('Repository ID','HuggingFace repo in the format username/model-name. Will be created if it doesn&apos;t exist.')}<input class="form-input" data-key="upload.repo_id" value="${c.repo_id}" placeholder="${S.hfUsername ? suggested : 'your-username/' + suggested}">
-    ${!c.repo_id ? `<div class="form-hint">Suggested name: <span style="color:var(--amber);cursor:pointer" onclick="document.querySelector('[data-key=\\'upload.repo_id\\']').value='${suggested}';S.config.upload.repo_id='${suggested}';renderStageContent()">${suggested}</span> (click to use)</div>` : ''}</div>
+    ${!c.repo_id ? `<div class="form-hint">Suggested name: <span style="color:var(--amber);cursor:pointer" onclick="document.querySelector('[data-key=\\'upload.repo_id\\']').value='${suggested}';S.config.upload.repo_id='${suggested}';saveFormState();renderStageContent()">${suggested}</span> (click to use)</div>` : ''}</div>
     <div class="form-group">${L('License','SPDX license identifier for the model card. Common: apache-2.0, mit, llama3, cc-by-nc-4.0')}<input class="form-input" data-key="upload.license" value="${c.license}"></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.private" ${c.private?'checked':''}><span class="form-label" data-tip="Private repos are only visible to you and collaborators you explicitly add." style="margin:0">Private repository</span></label></div>
     <div class="form-divider"></div><div class="form-section-label">What to upload</div>
@@ -489,41 +698,73 @@ function renderUpload() {
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_lora" ${c.upload_lora?'checked':''}><span class="form-label" style="margin:0">LoRA adapters</span></label></div>
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="upload.upload_merged" ${c.upload_merged?'checked':''}><span class="form-label" style="margin:0">Merged model (large)</span></label></div>
   </div>
-  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access.</div>
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-2);margin-top:16px;">Requires <code style="color:var(--amber)">HF_TOKEN</code> environment variable with write access. Set it in your shell before starting the pipeline server.</div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Upload</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
 
+// ── Tier Selection ─────────────────────────────────────────────────────────
+
+/**
+ * Toggle a quantization tier (Q3/Q4/Q5/Q6) on or off in the MagicQuant config.
+ * @param {string} t - Tier name
+ */
 function toggleTier(t) {
   const tiers = S.config.magicquant.tiers;
   const i = tiers.indexOf(t);
-  if(i>=0) tiers.splice(i,1); else tiers.push(t);
+  if (i >= 0) tiers.splice(i, 1); else tiers.push(t);
   document.querySelector(`[data-tier="${t}"]`)?.classList.toggle('selected');
+  saveFormState();
 }
 
-function appendLog(text, level='info') {
+// ── Log Panel ──────────────────────────────────────────────────────────────
+
+/**
+ * Append a log line to the output panel with a timestamp.
+ * Caps at 2000 lines to prevent memory issues.
+ * @param {string} text - Log message
+ * @param {string} [level='info'] - Log level (info, error, warn, stage, success, metric)
+ */
+function appendLog(text, level = 'info') {
   const body = document.getElementById('logs-body');
   const line = document.createElement('div');
   line.className = `log-line level-${level}`;
-  const ts = new Date().toLocaleTimeString('en-US',{hour12:false});
-  const div = document.createElement('div'); div.textContent = text;
-  line.innerHTML = `<span class="ts">${ts}</span>${div.innerHTML}`;
+  const ts = new Date().toLocaleTimeString('en-US', {hour12: false});
+  const safeText = document.createElement('span');
+  safeText.textContent = text;
+  line.innerHTML = `<span class="ts">${ts}</span>${safeText.innerHTML}`;
   body.appendChild(line);
-  while(body.children.length>2000) body.removeChild(body.firstChild);
-  if(S.autoScroll) body.scrollTop = body.scrollHeight;
+  while (body.children.length > 2000) body.removeChild(body.firstChild);
+  if (S.autoScroll) body.scrollTop = body.scrollHeight;
 }
-function clearLogs() { document.getElementById('logs-body').innerHTML=''; }
-function toggleAutoScroll() { S.autoScroll=!S.autoScroll; document.getElementById('autoscroll-label').textContent=S.autoScroll?'On':'Off'; }
 
+/** Clear all log lines from the output panel. */
+function clearLogs() { document.getElementById('logs-body').innerHTML = ''; }
+
+/** Toggle auto-scroll behavior for the log panel. */
+function toggleAutoScroll() {
+  S.autoScroll = !S.autoScroll;
+  document.getElementById('autoscroll-label').textContent = S.autoScroll ? 'On' : 'Off';
+}
+
+// ── Pipeline Execution ─────────────────────────────────────────────────────
+
+/**
+ * Validate the form, send a POST to /api/run, and start the pipeline.
+ * Shows errors in both the log panel and the status banner.
+ */
 async function runPipeline() {
-  if(S.running) return;
+  if (S.running) return;
+  dismissStatus();
   const enabled = Array.from(S.enabledStages);
-  if(enabled.length === 0) { appendLog('Enable at least one stage.','error'); return; }
-  S.running = true;
-  const btn = document.getElementById('btn-run');
-  btn.disabled = true; btn.textContent = 'Running...';
+  if (enabled.length === 0) {
+    showStatus('Enable at least one pipeline stage before running.', 'error');
+    appendLog('Enable at least one stage.', 'error');
+    return;
+  }
+  setPipelineRunning(true);
   clearLogs();
-  appendLog(`Pipeline: ${enabled.join(' \u2192 ')}`,'stage');
+  appendLog(`Pipeline: ${enabled.join(' \u2192 ')}`, 'stage');
   const payload = {
     training: S.config.training,
     export: S.config.export,
@@ -532,12 +773,38 @@ async function runPipeline() {
     enabled_stages: enabled,
   };
   try {
-    const r = await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const r = await fetch('/api/run', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
-    if(d.error){appendLog(d.error,'error');S.running=false;btn.disabled=false;btn.textContent='Run Pipeline';}
-  } catch(e){appendLog(`Request failed: ${e.message}`,'error');S.running=false;btn.disabled=false;btn.textContent='Run Pipeline';}
+    if (d.error) {
+      appendLog(d.error, 'error');
+      showStatus(d.error, 'error');
+      setPipelineRunning(false);
+    }
+  } catch (e) {
+    appendLog(`Request failed: ${e.message}`, 'error');
+    showStatus(`Failed to start pipeline: ${e.message}`, 'error');
+    setPipelineRunning(false);
+  }
 }
 
+/**
+ * Send a stop request to the backend to gracefully halt the running pipeline.
+ */
+async function stopPipeline() {
+  try {
+    const r = await fetch('/api/stop', {method: 'POST'});
+    const d = await r.json();
+    if (d.error) appendLog(d.error, 'warn');
+    else appendLog('Stop requested...', 'warn');
+  } catch (e) {
+    appendLog(`Stop request failed: ${e.message}`, 'error');
+  }
+}
+
+// ── Initialize ─────────────────────────────────────────────────────────────
+restoreFormState();
+loadConfig();
+connectWS();
 renderStageContent();
 </script>
 </body>

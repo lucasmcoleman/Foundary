@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Unsloth Pipeline UI — FastAPI backend.
+Pipeline UI — FastAPI backend.
 
-4-stage pipeline: Training → Export GGUF → MagicQuant → Upload
+Orchestrates a 4-stage LLM fine-tuning pipeline:
+  Training → Export GGUF → MagicQuant → Upload
+
+Uses WebSocket for real-time log streaming to the browser.
+Port defaults to 7865 (configurable via PIPELINE_UI_PORT env var).
 """
 
 import asyncio
@@ -18,12 +22,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Unsloth Pipeline")
+app = FastAPI(title="Pipeline UI")
 
 PIPELINE_DIR = Path(__file__).resolve().parent.parent
 VENV_PYTHON = str(PIPELINE_DIR / "unsloth-env" / "bin" / "python")
 if not Path(VENV_PYTHON).exists():
-    VENV_PYTHON = "/server/programming/unsloth-env/bin/python"
+    VENV_PYTHON = "/server/programming/pipeline/unsloth-env/bin/python"
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -38,6 +42,8 @@ class StageStatus(str, Enum):
 ALL_STAGES = ["training", "export", "magicquant", "upload"]
 
 class PipelineState:
+    """Shared mutable state for the running pipeline, including WebSocket fan-out."""
+
     def __init__(self):
         self.stages = {s: StageStatus.PENDING for s in ALL_STAGES}
         self.running = False
@@ -123,6 +129,7 @@ class RunRequest(BaseModel):
 # ── Subprocess helper ────────────────────────────────────────────────────────
 
 async def run_script(script: str, output_dir: str) -> int:
+    """Write a Python script to disk and execute it in the venv, streaming stdout to WebSocket clients."""
     # Resolve relative paths against the project root, not uvicorn's CWD
     out_path = Path(output_dir)
     if not out_path.is_absolute():
@@ -244,6 +251,7 @@ def _resolve_out(output_dir: str) -> Path:
 
 
 async def do_training(cfg: RunRequest) -> bool:
+    """Run the QLoRA training stage. Skips if LoRA adapters already exist."""
     tc = cfg.training
     out = _resolve_out(tc.output_dir)
 
@@ -261,7 +269,7 @@ async def do_training(cfg: RunRequest) -> bool:
 
     await state.set_stage("training", StageStatus.RUNNING)
     await state.set_progress(0)
-    await state.log("Starting Unsloth QLoRA training (completion-only loss)", "stage")
+    await state.log("Starting QLoRA training (completion-only loss)", "stage")
 
     # Improvement #2: completion_only_loss
     script = f'''
@@ -514,6 +522,7 @@ print("PIPELINE_STAGE_COMPLETE=export")
 
 
 async def do_magicquant(cfg: RunRequest) -> bool:
+    """Run MagicQuant evolutionary search and generate tiered hybrid GGUFs."""
     out = cfg.training.output_dir
     out_abs = _resolve_out(out)
     mc = cfg.magicquant
@@ -638,6 +647,7 @@ print("PIPELINE_STAGE_COMPLETE=magicquant")
 
 
 async def do_upload(cfg: RunRequest) -> bool:
+    """Upload pipeline artifacts (GGUF, LoRA, merged) to HuggingFace Hub."""
     out = cfg.training.output_dir
     uc = cfg.upload
     await state.set_stage("upload", StageStatus.RUNNING)
@@ -705,7 +715,7 @@ for local, name in files:
 card_data = ModelCardData(
     license="{uc.license}", library_name="llama.cpp",
     base_model="{base_model}", pipeline_tag="text-generation",
-    tags=["gguf", "quantized", "unsloth", "magicquant"],
+    tags=["gguf", "quantized", "magicquant"],
 )
 card_md = f"""---
 {{card_data.to_yaml()}}
@@ -719,7 +729,7 @@ Fine-tuned from [{base_model}](https://huggingface.co/{base_model}).
 |------|------|
 {{gguf_table}}
 
-*Generated with the Unsloth Pipeline (QLoRA r={lora_r}, alpha={lora_alpha}, completion-only loss)*
+*Generated with the MagicQuant Pipeline (QLoRA r={lora_r}, alpha={lora_alpha}, completion-only loss)*
 """
 try:
     ModelCard(card_md).push_to_hub(repo_id)
@@ -819,6 +829,7 @@ def _derive_model_short_name(cfg: RunRequest) -> str:
 
 
 async def run_pipeline(cfg: RunRequest):
+    """Execute enabled pipeline stages in order: training, export, magicquant, upload."""
     state.running = True
     enabled = set(cfg.enabled_stages)
 
@@ -860,6 +871,7 @@ async def run_pipeline(cfg: RunRequest):
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 def load_config() -> dict:
+    """Load persisted UI config from config.json, or return empty dict on failure."""
     if CONFIG_PATH.exists():
         try:
             return json.loads(CONFIG_PATH.read_text())
@@ -868,6 +880,7 @@ def load_config() -> dict:
     return {}
 
 def save_config(cfg: dict):
+    """Persist UI config to config.json."""
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 
@@ -875,10 +888,13 @@ def save_config(cfg: dict):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    """Serve the single-page frontend HTML."""
     return FileResponse(Path(__file__).parent / "index.html")
+
 
 @app.get("/api/state")
 async def get_state():
+    """Return the current pipeline state: stage statuses, running flag, and progress."""
     return {
         "stages": {k: v.value for k, v in state.stages.items()},
         "running": state.running,
@@ -886,19 +902,30 @@ async def get_state():
         "progress": state.progress,
     }
 
+
 @app.get("/api/config")
 async def get_config():
+    """Return the persisted UI configuration (e.g. HuggingFace username)."""
     return load_config()
+
 
 @app.post("/api/config")
 async def set_config(body: dict):
+    """Merge and persist UI configuration values. Returns the updated config."""
     cfg = load_config()
     cfg.update(body)
     save_config(cfg)
     return cfg
 
+
 @app.post("/api/run")
 async def start_pipeline(cfg: RunRequest):
+    """
+    Launch the pipeline in a background task.
+
+    Accepts a full RunRequest with per-stage config and an enabled_stages list.
+    Returns an error if a pipeline is already in progress.
+    """
     if state.running:
         return {"error": "Pipeline is already running"}
     for s in ALL_STAGES:
@@ -907,8 +934,27 @@ async def start_pipeline(cfg: RunRequest):
     asyncio.create_task(run_pipeline(cfg))
     return {"status": "started"}
 
+
+@app.post("/api/stop")
+async def stop_pipeline():
+    """Request a graceful pipeline stop. Sets the running flag to False."""
+    if not state.running:
+        return {"error": "Pipeline is not running"}
+    state.running = False
+    await state.log("Stop requested by user", "warn")
+    await state.broadcast({"type": "pipeline_done"})
+    return {"status": "stopping"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    """
+    WebSocket endpoint for real-time log streaming.
+
+    Clients connect here to receive log lines, stage updates, and progress
+    events as JSON messages. The connection stays open until the client
+    disconnects.
+    """
     await ws.accept()
     state.ws_clients.append(ws)
     try:
@@ -918,6 +964,8 @@ async def websocket_endpoint(ws: WebSocket):
         if ws in state.ws_clients:
             state.ws_clients.remove(ws)
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7870)
+    port = int(os.environ.get("PIPELINE_UI_PORT", 7865))
+    uvicorn.run(app, host="0.0.0.0", port=port)
