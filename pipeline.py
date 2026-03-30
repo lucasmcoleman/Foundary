@@ -1,11 +1,15 @@
 """
-Unified pipeline: Training → Export GGUF → MagicQuant → HF Upload.
+Unified pipeline: Training → Export → MagicQuant → HF Upload.
 
-Improvements over v1:
-  1. Merged+Convert collapsed into single "Export" stage via save_pretrained_gguf
-  2. Completion-only training (masks system prompt & user messages)
-  3. Dataset validation pre-flight check before training
-  4. Auto-install llama.cpp if not found (needed by MagicQuant for real PPL probing)
+Uses custom fast loaders instead of Unsloth to avoid single-threaded
+safetensors chunking that stalls on AMD APU unified memory (128 GB GTT).
+
+Key design decisions:
+  - Training uses shard-by-shard BnB 4-bit quantization on GPU (fast_train_zeroclaw.py)
+  - Export uses streaming LoRA merge at ~6 GB peak memory (fast_export.py)
+  - Completion-only loss masks system/user turns (only assistant responses contribute)
+  - Dataset validation pre-flight check before committing GPU time
+  - Auto-install llama.cpp if not found (needed by MagicQuant for perplexity probing)
 """
 
 import json
@@ -24,11 +28,11 @@ class TrainingConfig:
     model_name: str = "Tesslate/OmniCoder-9B"
     dataset_path: str = "zeroclaw_training_data.jsonl"
     max_seq_length: int = 8192
-    load_in_4bit: bool = True
+    load_in_4bit: bool = True  # Unused by fast loader (always 4-bit), kept for config compat
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    use_rslora: bool = True
+    use_rslora: bool = True  # Unused by fast loader (Unsloth-specific), kept for config compat
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
@@ -278,92 +282,85 @@ def ensure_llamacpp(hint: Optional[str], log: LogFn) -> Optional[Path]:
 
 
 # ── Stage: Training (with completion-only loss) ─────────────────────────────
+#
+# Uses the custom fast loader (fast_train_zeroclaw.py) instead of Unsloth.
+# The fast loader creates the model on meta device, loads safetensors
+# shard-by-shard with inline BnB 4-bit quantization, and uses PEFT LoRA
+# directly. This avoids Unsloth's single-threaded safetensors chunking
+# that crawls to a halt on unified memory as GTT fills.
 
 def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
-    """Run Unsloth QLoRA training with completion-only loss."""
-    # Improvement #3: validate first
+    """Run QLoRA training with completion-only loss using the custom fast loader.
+
+    Uses fast_train_zeroclaw.py's shard-by-shard loading instead of Unsloth's
+    FastLanguageModel, which causes single-threaded sequential safetensors
+    chunking on AMD APU unified memory.
+    """
+    # Validate dataset before committing GPU time.
     if not validate_dataset(config.training.dataset_path, log):
         return False
 
-    log("Starting Unsloth QLoRA training (completion-only)", "stage")
+    log("Starting QLoRA training (fast loader, completion-only loss)", "stage")
     tc = config.training
 
-    # Improvement #2: completion_only_loss=True in SFTTrainer
-    # We pass messages directly to SFTTrainer (not pre-formatted text)
-    # so TRL can compute the completion_mask from the chat template.
+    # Generate a training script that uses the custom fast loader.
+    # This runs as a subprocess so GPU memory is fully freed when it exits.
     script = f'''
-import os
+import os, re, gc, json, time
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import torch
+from pathlib import Path
 from datasets import load_dataset
-from unsloth import FastLanguageModel
-from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{tc.model_name}",
-    max_seq_length={tc.max_seq_length},
-    load_in_4bit={tc.load_in_4bit},
-)
+# ── Fast model loading (shard-by-shard with inline BnB quantization) ──
+# Import and call the fast loader directly instead of Unsloth.
+import sys
+sys.path.insert(0, "{Path.cwd()}")
+from fast_train_zeroclaw import fast_load_quantized_model, detect_response_template, find_latest_checkpoint
 
-model = FastLanguageModel.get_peft_model(
-    model,
+DEVICE = torch.device("cuda:0")
+model, tokenizer = fast_load_quantized_model("{tc.model_name}")
+
+# ── Attach LoRA adapters ──
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+lora_config = LoraConfig(
     r={tc.lora_r}, lora_alpha={tc.lora_alpha}, lora_dropout={tc.lora_dropout},
     target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    use_rslora={tc.use_rslora},
-    use_gradient_checkpointing="unsloth",
+    bias="none", task_type="CAUSAL_LM",
 )
+model = get_peft_model(model, lora_config)
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
 print(f"Trainable: {{trainable:,}} / {{total:,}} ({{100*trainable/total:.2f}}%)")
 
+# ── Load and format dataset ──
 dataset = load_dataset("json", data_files="{tc.dataset_path}", split="train")
 print(f"Dataset: {{len(dataset)}} examples")
 
-# Completion-only loss: mask everything except assistant responses.
-# Auto-detect the assistant header from the chat template by rendering a
-# minimal conversation and extracting the text that precedes the assistant content.
-from trl import DataCollatorForCompletionOnlyLM
+def fmt(ex):
+    ex["text"] = tokenizer.apply_chat_template(
+        ex["messages"], tokenize=False, add_generation_prompt=False,
+    )
+    return ex
+dataset = dataset.map(fmt)
 
-_probe = tokenizer.apply_chat_template(
-    [{{"role": "user", "content": "X"}}, {{"role": "assistant", "content": "Y"}}],
-    tokenize=False, add_generation_prompt=False,
-)
-# Find the marker text between the user turn and the assistant content "Y"
-_y_pos = _probe.rfind("Y")
-# Walk backwards from "Y" to find the start of the assistant header
-# Skip any <think>...</think> blocks that some models inject
-_header_end = _y_pos
-_before_y = _probe[:_y_pos]
-# Strip think blocks if present (e.g. Qwen3.5 inserts <think>...</think> wrappers)
-import re as _re
-_before_y_clean = _re.sub(r"<think>.*?</think>\\s*", "", _before_y, flags=_re.DOTALL)
-# Find where the previous turn ends (look for the last end-of-turn marker before assistant)
-# Common end markers: <|im_end|>, <|eot_id|>, <end_of_turn>, </s>
-_end_markers = ["<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>"]
-_last_end = -1
-_marker_len = 0
-for _em in _end_markers:
-    _p = _before_y_clean.rfind(_em)
-    if _p > _last_end:
-        _last_end = _p
-        _marker_len = len(_em)
-if _last_end >= 0:
-    response_template = _before_y_clean[_last_end + _marker_len:].lstrip("\\n")
-else:
-    response_template = _before_y_clean.split("\\n")[-1]
-
-print(f"Auto-detected response template: {{repr(response_template)}}")
+# ── Completion-only loss masking ──
+# Only assistant turns contribute to the loss. System/user turns are masked.
+response_template = detect_response_template(tokenizer)
 response_ids = tokenizer.encode(response_template, add_special_tokens=False)
 collator = DataCollatorForCompletionOnlyLM(
     response_template=response_ids,
     tokenizer=tokenizer,
 )
 
+# ── Training ──
 training_args = SFTConfig(
     output_dir="{config.output_dir}",
     num_train_epochs={tc.num_train_epochs},
@@ -383,22 +380,17 @@ training_args = SFTConfig(
     dataset_text_field="text",
 )
 
-# Pre-format with chat template
-def fmt(ex):
-    ex["text"] = tokenizer.apply_chat_template(
-        ex["messages"], tokenize=False, add_generation_prompt=False,
-    )
-    return ex
-
-dataset = dataset.map(fmt)
+tokenizer.model_max_length = {tc.max_seq_length}
 
 trainer = SFTTrainer(
-    model=model, tokenizer=tokenizer, train_dataset=dataset,
+    model=model, processing_class=tokenizer, train_dataset=dataset,
     args=training_args,
     data_collator=collator,
 )
 
-stats = trainer.train()
+# Resume from checkpoint if one exists (e.g. after crash or OOM).
+resume_ckpt = find_latest_checkpoint("{config.output_dir}")
+stats = trainer.train(resume_from_checkpoint=resume_ckpt)
 print(f"PIPELINE_TRAINING_LOSS={{stats.training_loss:.4f}}")
 
 lora_dir = "{artifacts.lora_dir}"
@@ -424,91 +416,67 @@ print("PIPELINE_STAGE_COMPLETE=training")
     return True
 
 
-# ── Stage: Export (merge + GGUF in one shot) ─────────────────────────────────
+# ── Stage: Export (streaming LoRA merge) ──────────────────────────────────────
+#
+# Uses fast_export.py's streaming shard-by-shard merge instead of Unsloth's
+# save_pretrained_merged(), which loads the entire model into memory (~80 GB
+# for a 40B model). The streaming merge peaks at ~6 GB.
 
 def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
-    """Merge LoRA + export. Adapts output based on downstream stages.
+    """Merge LoRA adapters into base model using streaming shard-by-shard merge.
 
-    - MagicQuant enabled: merge to safetensors (MagicQuant reads them directly)
-    - MagicQuant disabled: merge + convert to GGUF in one shot
+    Always produces safetensors output (MagicQuant or llama.cpp handles GGUF).
+    Uses fast_export.py instead of Unsloth to avoid loading the full model.
     """
     ec = config.export
-    mq_enabled = config.magicquant is not None
 
     if not artifacts.lora_dir.exists():
         log("No LoRA adapters found — run training first", "error")
         return False
 
-    if mq_enabled:
-        log("Merging LoRA to safetensors (MagicQuant will handle GGUF creation)", "stage")
-        script = f'''
-import os
-os.environ["HSA_ENABLE_SDMA"] = "0"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+    log("Merging LoRA to safetensors (streaming shard-by-shard)", "stage")
 
-from unsloth import FastLanguageModel
-print("Loading model with LoRA adapters...")
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{artifacts.lora_dir}", max_seq_length=4096, load_in_4bit=False,
-)
-print("Merging to safetensors...")
-model.save_pretrained_merged("{artifacts.merged_dir}", tokenizer, save_method="merged_16bit")
-print("PIPELINE_STAGE_COMPLETE=export")
-'''
+    # Read the adapter_config.json to find the base model ID.
+    import json as _json
+    adapter_config_path = artifacts.lora_dir / "adapter_config.json"
+    if adapter_config_path.exists():
+        with open(adapter_config_path) as f:
+            adapter_cfg = _json.load(f)
+        base_model_id = adapter_cfg.get("base_model_name_or_path", config.training.model_name)
     else:
-        log(f"Exporting to {ec.gguf_type.upper()} GGUF (merge + convert)", "stage")
-        gguf_out = str(artifacts.output_dir)
-        save_merged = "True" if ec.also_save_merged else "False"
-        script = f'''
-import os, shutil
+        base_model_id = config.training.model_name
+
+    # Generate an export script that uses the custom fast merge.
+    script = f'''
+import os, sys
 os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
-os.environ["UNSLOTH_SKIP_TORCHVISION_CHECK"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
-from pathlib import Path
-from unsloth import FastLanguageModel
-print("Loading model with LoRA adapters...")
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="{artifacts.lora_dir}", max_seq_length=4096, load_in_4bit=False,
+sys.path.insert(0, "{Path.cwd()}")
+from fast_export import streaming_merge
+
+streaming_merge(
+    model_id="{base_model_id}",
+    lora_dir="{artifacts.lora_dir}",
+    merged_dir="{artifacts.merged_dir}",
 )
-
-if {save_merged}:
-    print("Also saving merged HF safetensors...")
-    model.save_pretrained_merged("{artifacts.merged_dir}", tokenizer, save_method="merged_16bit")
-
-print("Merging + converting to {ec.gguf_type.upper()} GGUF...")
-model.save_pretrained_gguf("{gguf_out}", tokenizer, quantization_method="{ec.gguf_type}")
-
-# Rename to predictable path
-dst = Path("{artifacts.bf16_gguf}")
-for d in [Path("{gguf_out}"), Path("{gguf_out}_gguf")]:
-    if d.exists():
-        for f in d.glob("*.gguf"):
-            if f != dst:
-                shutil.move(str(f), str(dst))
-                break
-if dst.exists():
-    size = dst.stat().st_size / 1e9
-    print(f"GGUF: {{dst}} ({{size:.1f}} GB)")
 print("PIPELINE_STAGE_COMPLETE=export")
 '''
 
     script_path = artifacts.output_dir / "_stage_export.py"
     script_path.write_text(script)
 
-    rc = _run([_find_python(), "-u", str(script_path)], log)
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(Path.cwd()))
     if rc != 0:
         log(f"Export failed (exit code {rc})", "error")
         return False
 
-    if mq_enabled and artifacts.merged_dir.exists():
+    if artifacts.merged_dir.exists():
         log(f"Merged safetensors ready at {artifacts.merged_dir}", "success")
-    elif not mq_enabled and artifacts.bf16_gguf.exists():
-        size_gb = artifacts.bf16_gguf.stat().st_size / 1e9
-        log(f"BF16 GGUF: {artifacts.bf16_gguf} ({size_gb:.1f} GB)", "success")
+    else:
+        log("Merged model directory not found after export", "error")
+        return False
 
     log("Export complete", "success")
     return True
@@ -653,7 +621,7 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
         library_name="llama.cpp",
         base_model=base_model,
         pipeline_tag="text-generation",
-        tags=["gguf", "quantized", "unsloth", "magicquant"],
+        tags=["gguf", "quantized", "qlora", "magicquant"],
     )
 
     card_content = f"""---
@@ -666,7 +634,7 @@ Fine-tuned and quantized from [{base_model}](https://huggingface.co/{base_model}
 
 ## Pipeline
 
-- **Training**: Unsloth QLoRA (r={tc.lora_r}, alpha={tc.lora_alpha}, rsLoRA, completion-only loss)
+- **Training**: QLoRA (r={tc.lora_r}, alpha={tc.lora_alpha}, completion-only loss)
 - **Quantization**: MagicQuant hybrid evolutionary search
 
 ## Files
@@ -682,7 +650,7 @@ llama-cli -m <filename>.gguf -p "Your prompt here"
 ```
 
 ---
-*Generated with the Unsloth Pipeline*
+*Generated with the MagicQuant Pipeline*
 """
 
     try:

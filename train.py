@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-Unsloth QLoRA Fine-Tuning Script
+LEGACY: Unsloth QLoRA Fine-Tuning Script
+
+WARNING: This script uses Unsloth's FastLanguageModel which causes
+single-threaded safetensors chunking on AMD APU unified memory. For 40B+
+models on Strix Halo, use fast_train_zeroclaw.py instead (or pipeline.py
+which now calls the fast loader automatically).
+
+This script is kept for reference and for use on NVIDIA GPUs where Unsloth
+works correctly.
 
 Based on the approach used for peterjohannmedina/Medina-Qwen3.5-27B-OpenClaw.
-Designed for AMD ROCm (gfx1151 / Strix Halo) but works on NVIDIA too.
 
 Usage:
     python train.py --config config.yaml

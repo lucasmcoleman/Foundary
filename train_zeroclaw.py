@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Train OmniCoder-9B on ZeroClaw tool-call data using Unsloth QLoRA.
+LEGACY: Train OmniCoder-9B on ZeroClaw tool-call data using Unsloth QLoRA.
+
+WARNING: This script uses Unsloth's FastLanguageModel which causes
+single-threaded safetensors chunking on AMD APU unified memory. For
+training on Strix Halo, use fast_train_zeroclaw.py instead.
 """
 
 import os
