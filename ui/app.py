@@ -25,9 +25,9 @@ from pydantic import BaseModel
 app = FastAPI(title="Pipeline UI")
 
 PIPELINE_DIR = Path(__file__).resolve().parent.parent
-VENV_PYTHON = str(PIPELINE_DIR / "unsloth-env" / "bin" / "python")
+VENV_PYTHON = str(PIPELINE_DIR / ".venv" / "bin" / "python")
 if not Path(VENV_PYTHON).exists():
-    VENV_PYTHON = "/server/programming/pipeline/unsloth-env/bin/python"
+    VENV_PYTHON = "/server/programming/pipeline/.venv/bin/python"
 
 
 # ── State ────────────────────────────────────────────────────────────────────

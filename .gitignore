@@ -1,5 +1,5 @@
 # Virtual environment
-unsloth-env/
+.venv/
 
 # Python
 __pycache__/

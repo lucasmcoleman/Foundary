@@ -6,7 +6,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Activate venv
-source "$SCRIPT_DIR/unsloth-env/bin/activate"
+source "$SCRIPT_DIR/.venv/bin/activate"
 
 # Add core modules to Python path
 export PYTHONPATH="$SCRIPT_DIR/core:${PYTHONPATH:-}"

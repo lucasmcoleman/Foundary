@@ -17,7 +17,7 @@
 set -euo pipefail
 
 PIPELINE_DIR="/server/programming/pipeline"
-VENV_DIR="${PIPELINE_DIR}/unsloth-env"
+VENV_DIR="${PIPELINE_DIR}/.venv"
 MAGICQUANT_DIR="/server/programming/MagicQuant"
 GGUF_DIR="/server/ai/models/lmcoleman/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"
 SOURCE_DIR="/server/ai/models/source/Huihui-Qwen3.5-9B-Claude-4.6-Opus-abliterated"

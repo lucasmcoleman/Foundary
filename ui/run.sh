@@ -4,11 +4,11 @@
 # Usage: ./run.sh [port]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV="${SCRIPT_DIR}/../unsloth-env/bin"
+VENV="${SCRIPT_DIR}/../.venv/bin"
 
-# Fallback to root-level venv
+# Fallback to parent-level venv
 if [ ! -f "$VENV/uvicorn" ]; then
-    VENV="/server/programming/pipeline/unsloth-env/bin"
+    VENV="/server/programming/unsloth-env/bin"
 fi
 
 PORT="${1:-7865}"

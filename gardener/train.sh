@@ -2,12 +2,12 @@
 # Train the NC Master Gardener model using the existing pipeline.
 #
 # Usage:
-#   cd /server/programming/unsloth
+#   cd /server/programming/pipeline
 #   bash gardener/train.sh
 #
 # Prerequisites:
 #   1. Generate training data first:  python gardener/generate.py
-#   2. Activate venv:                 source unsloth-env/bin/activate
+#   2. Activate venv:                 source activate.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -32,7 +32,7 @@ echo ""
 
 # Activate venv if not already
 if [ -z "${VIRTUAL_ENV:-}" ]; then
-    source unsloth-env/bin/activate
+    source .venv/bin/activate
 fi
 
 python pipeline.py \

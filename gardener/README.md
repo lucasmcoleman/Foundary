@@ -8,8 +8,8 @@ soil science, permaculture, and organic food production.
 ### 1. Generate Training Data
 
 ```bash
-cd /server/programming/unsloth
-source unsloth-env/bin/activate
+cd /server/programming/pipeline
+source activate.sh
 
 # Set your API key
 export ANTHROPIC_API_KEY=sk-ant-...
