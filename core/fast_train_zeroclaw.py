@@ -70,6 +70,12 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
 
     print(f"Loading config for {model_id}...")
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    # Composite/multimodal models (e.g. Qwen3.5) wrap the text config inside
+    # a top-level config that lacks vocab_size etc.  Unwrap for CausalLM.
+    _is_composite = hasattr(config, 'text_config')
+    if _is_composite:
+        print(f"  Unwrapping composite config: {type(config).__name__} -> {type(config.text_config).__name__}")
+        config = config.text_config
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     print("Ensuring model files are cached...")
@@ -92,9 +98,27 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     else:
         raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
+    # Composite models save weights with a "model.language_model." prefix and
+    # include vision encoder tensors ("model.visual.").  Since we build a
+    # text-only CausalLM, remap the language_model keys and drop vision keys.
+    if _is_composite:
+        remapped_weight_map = {}
+        skipped = 0
+        for orig_name, shard_name in weight_map.items():
+            if orig_name.startswith("model.visual"):
+                skipped += 1
+                continue
+            new_name = orig_name.replace("model.language_model.", "model.", 1)
+            remapped_weight_map[new_name] = (shard_name, orig_name)
+        weight_map = remapped_weight_map
+        if skipped:
+            print(f"  Skipped {skipped} vision encoder tensors (not needed for CausalLM)")
+    else:
+        weight_map = {name: (shard, name) for name, shard in weight_map.items()}
+
     # Group tensors by shard so we can load one shard file at a time.
     shards = {}
-    for tensor_name, shard_name in weight_map.items():
+    for tensor_name, (shard_name, _orig_name) in weight_map.items():
         shards.setdefault(shard_name, []).append(tensor_name)
 
     # Create model on meta device — this builds the full module tree (all layers,
@@ -160,14 +184,16 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
 
         try:
             for name in tensor_names:
-                # Navigate the module tree to find the target parameter.
+                # Navigate the module tree using the (possibly remapped) name.
                 parts = name.split(".")
                 target = model
                 for part in parts[:-1]:
                     target = getattr(target, part)
                 attr = parts[-1]
 
-                tensor = shard_data[name]
+                # Read tensor from shard using the original (on-disk) key.
+                _shard_name, orig_name = weight_map[name]
+                tensor = shard_data[orig_name]
 
                 if isinstance(target, bnb.nn.Linear4bit) and attr == "weight":
                     # Quantize to NF4 on GPU. The .to(DEVICE) transfer and Params4bit

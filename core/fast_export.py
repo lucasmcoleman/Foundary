@@ -184,6 +184,14 @@ def streaming_merge(
             if os.path.exists(src2):
                 shutil.copy2(src2, merged_path / fname)
 
+    # Detect composite naming: LoRA keys use CausalLM names (model.layers.*)
+    # but composite model shards use model.language_model.layers.*.
+    # Build a mapping from shard tensor names to LoRA map keys.
+    _composite_prefix = "model.language_model."
+    _has_composite_names = any(k.startswith(_composite_prefix) for k in weight_map)
+    if _has_composite_names and lora_map:
+        print("  Detected composite model naming — will remap LoRA keys during merge")
+
     merged_count = 0
     total_t0 = time.time()
     new_weight_map = {}
@@ -200,8 +208,14 @@ def streaming_merge(
         try:
             modified = 0
             for name in tensor_names:
-                if name in lora_map:
-                    a_weight, b_weight, scaling = lora_map[name]
+                # For composite models, strip the language_model prefix to match
+                # LoRA keys (PEFT stores keys without the composite wrapper).
+                lora_key = name
+                if _has_composite_names and name.startswith(_composite_prefix):
+                    lora_key = "model." + name[len(_composite_prefix):]
+
+                if lora_key in lora_map:
+                    a_weight, b_weight, scaling = lora_map[lora_key]
                     orig_dtype = shard_data[name].dtype
 
                     # Perform the LoRA merge on GPU: W_new = W + scaling * (B @ A)
