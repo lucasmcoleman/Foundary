@@ -19,20 +19,17 @@ Both repos pushed directly to `master` (no branch protection encountered).
 Contained compiled Unsloth trainer modules (UnslothSFTTrainer.py, etc.) with Python 3.12 bytecode cache. Confirmed unreferenced by either repository — only present in `pipeline/.gitignore`. The pipeline migrated away from Unsloth to custom fast loaders in commits `cc18026` and `2c017f8`.
 
 ### unsloth-env/
-**Status: SYMLINKS REMOVED, DEPENDENCIES DECLARED**
+**Status: FULLY RESOLVED — DELETED**
 
-The `pipeline/.venv` skeleton previously symlinked into `unsloth-env/`:
-- `.venv/lib/python3.12/site-packages` -> `unsloth-env/lib/python3.12/site-packages`
-- `.venv/bin/uvicorn` -> `unsloth-env/bin/uvicorn`
-- `.venv/bin/pip` -> `unsloth-env/bin/pip`
+The `pipeline/.venv` symlink skeleton has been replaced with a self-contained venv:
+1. ROCm-specific packages (torch, triton, rocm, torchaudio, torchvision, torchao, bitsandbytes, xformers, cut-cross-entropy) were repacked as wheels from the unsloth-env installation and installed into the fresh venv
+2. MagicQuant installed as editable package from `/server/programming/MagicQuant`
+3. All remaining PyPI dependencies installed via `pip install -e ".[dev]"`
+4. The `pipeline/MagicQuant/magicquant` symlink was removed (MagicQuant is now a proper pip package)
+5. `unsloth-env/` has been deleted from the workspace
+6. Repacked ROCm wheels preserved at `/tmp/rocm_wheels/` for future venv rebuilds
 
-All runtime dependencies have been declared in `pipeline/pyproject.toml` with appropriate version ranges. The dependency on `magicquant>=0.1.0` replaces the MagicQuant symlink. The `.gitignore` now includes `unsloth-env/`.
-
-**Manual action required**: To complete the cleanup:
-1. Delete `pipeline/.venv` (the symlink skeleton)
-2. Create fresh venv: `python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`
-3. Install ROCm-specific PyTorch per AMD instructions
-4. Delete `/server/programming/unsloth-env/` once the fresh venv is verified
+Verified: `torch 2.11.0a0+rocm7.11.0a20260106` loads with GPU (`Radeon 8060S Graphics`), all imports work, 18/18 tests pass, `pip check` reports no broken requirements.
 
 ## Key Changes Made
 
@@ -71,15 +68,14 @@ All runtime dependencies have been declared in `pipeline/pyproject.toml` with ap
 
 ## Manual Action Items
 
-1. **Complete unsloth-env cleanup**: Delete `pipeline/.venv` and `unsloth-env/`, create fresh venv with `pip install -e ".[dev]"`. Install ROCm PyTorch separately.
+### Resolved
+1. ~~**Complete unsloth-env cleanup**~~ — DONE. Fresh venvs created in both repos with ROCm wheels repacked from unsloth-env. `unsloth-env/` deleted. MagicQuant symlink removed.
+2. ~~**MagicQuant as proper dependency**~~ — DONE. Installed as editable package (`pip install -e ../MagicQuant`) in pipeline's venv. `pyproject.toml` declares `magicquant>=0.1.0` for portability.
+3. ~~**UI authentication**~~ — DONE. Optional API key auth added via `PIPELINE_API_KEY` env var. Bearer token on REST, query param on WebSocket. Backward compatible when unset.
 
-2. **MagicQuant as proper dependency**: Currently `pyproject.toml` declares `magicquant>=0.1.0`. For local development, install with `pip install -e ../MagicQuant`. For production, MagicQuant should be published to PyPI or installed from git URL.
-
-3. **UI authentication**: The FastAPI UI serves on `0.0.0.0:7865` without authentication. Add an auth layer before exposing to untrusted networks.
-
+### Remaining
 4. **Training data**: `data/zeroclaw_training_data.jsonl` is tracked in git. Consider moving to HuggingFace Datasets or S3 for production.
-
-5. **ROCm PyTorch variant**: `pyproject.toml` declares `torch>=2.0.0` without specifying the ROCm variant. AMD users need to install the ROCm torch build manually.
+5. **ROCm PyTorch variant**: `pyproject.toml` declares `torch>=2.0.0` without specifying the ROCm variant. ROCm wheels are preserved at `/tmp/rocm_wheels/` for rebuilding venvs. For fresh installs on AMD, install these wheels first then `pip install -e ".[dev]"`.
 
 ## Security Issues Found
 
