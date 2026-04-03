@@ -50,6 +50,11 @@ class FoundrySettings(BaseSettings):
     # -- Export --
     gguf_type: str = "bf16"
 
+    # -- Heretic (abliteration) --
+    heretic_n_trials: int = 200
+    heretic_quantization: str = "bnb_4bit"
+    heretic_kl_scale: float = 1.0
+
     # -- MagicQuant --
     target_base_quant: str = "MXFP4_MOE"
     mq_generations: int = 50

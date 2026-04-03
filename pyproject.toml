@@ -43,6 +43,9 @@ dependencies = [
     # Quantization
     "magicquant>=0.1.0",
 
+    # Abliteration (safety alignment removal)
+    "heretic-llm>=0.1.0",
+
     # Utilities
     "tqdm>=4.60.0",
     "psutil>=5.9.0",

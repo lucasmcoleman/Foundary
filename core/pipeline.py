@@ -1,5 +1,5 @@
 """
-Foundry pipeline: Training → Export → MagicQuant → HF Upload.
+Foundry pipeline: Training → Export → Heretic → MagicQuant → HF Upload.
 
 Uses custom fast loaders to avoid single-threaded safetensors chunking
 that stalls on AMD APU unified memory (128 GB GTT).
@@ -7,6 +7,7 @@ that stalls on AMD APU unified memory (128 GB GTT).
 Key design decisions:
   - Training uses shard-by-shard BnB 4-bit quantization on GPU (fast_train_zeroclaw.py)
   - Export uses streaming LoRA merge at ~6 GB peak memory (fast_export.py)
+  - Heretic removes safety alignment via Optuna-optimized directional ablation
   - Completion-only loss masks system/user turns (only assistant responses contribute)
   - Dataset validation pre-flight check before committing GPU time
   - Auto-install llama.cpp if not found (needed by MagicQuant for perplexity probing)
@@ -50,6 +51,17 @@ class ExportConfig:
 
 
 @dataclass
+class HereticConfig:
+    """Heretic abliteration (safety alignment removal via directional ablation)."""
+    n_trials: int = 200
+    n_startup_trials: int = 60
+    quantization: str = "bnb_4bit"  # "none" or "bnb_4bit"
+    kl_divergence_scale: float = 1.0
+    orthogonalize_direction: bool = False
+    row_normalization: str = "none"  # "none", "pre", or "full"
+
+
+@dataclass
 class MagicQuantConfig:
     target_base_quant: str = "MXFP4_MOE"
     generations: int = 50
@@ -75,6 +87,7 @@ class PipelineConfig:
     output_dir: str = "./output"
     training: TrainingConfig = field(default_factory=TrainingConfig)
     export: Optional[ExportConfig] = field(default_factory=ExportConfig)
+    heretic: Optional[HereticConfig] = None
     magicquant: Optional[MagicQuantConfig] = field(default_factory=MagicQuantConfig)
     upload: Optional[UploadConfig] = None
 
@@ -97,6 +110,10 @@ class Artifacts:
     @property
     def bf16_gguf(self) -> Path:
         return self.output_dir / "model-bf16.gguf"
+
+    @property
+    def heretic_dir(self) -> Path:
+        return self.output_dir / "heretic_model"
 
     @property
     def magicquant_dir(self) -> Path:
@@ -469,6 +486,338 @@ print("PIPELINE_STAGE_COMPLETE=export")
     return True
 
 
+# ── Stage: Heretic (abliteration) ───────────────────────────────────────────
+#
+# Removes safety alignment from LLMs via Optuna-optimized directional ablation.
+# Uses heretic-llm's internal API (not the CLI) to avoid interactive prompts.
+# Runs as a subprocess so GPU memory is fully freed afterward.
+
+def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+    """Run heretic abliteration on the merged model.
+
+    Invokes heretic's internal API programmatically (bypassing the interactive CLI)
+    to run Optuna optimization, select the best Pareto-optimal trial, apply it,
+    and save the merged abliterated model as HF safetensors.
+    """
+    log("Starting heretic abliteration", "stage")
+
+    if not artifacts.merged_dir.exists():
+        log("No merged model found — run export first", "error")
+        return False
+
+    hc = config.heretic
+    heretic_output = str(artifacts.heretic_dir)
+    checkpoint_dir = str(artifacts.output_dir / "_heretic_checkpoints")
+
+    # Build a self-contained script that uses heretic's internal API directly.
+    # This bypasses all questionary interactive prompts in heretic's main.py.
+    script = f'''
+import math
+import os
+import sys
+import time
+import warnings
+
+os.environ["HSA_ENABLE_SDMA"] = "0"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
+import torch
+import torch.nn.functional as F
+import optuna
+import transformers
+from optuna.samplers import TPESampler
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+from optuna.study import StudyDirection
+from optuna.trial import TrialState
+from optuna.exceptions import ExperimentalWarning
+from optuna import Trial, TrialPruned
+from dataclasses import asdict
+
+from heretic.config import Settings, QuantizationMethod, RowNormalization
+from heretic.model import Model, AbliterationParameters
+from heretic.evaluator import Evaluator
+from heretic.utils import (
+    empty_cache,
+    format_duration,
+    get_trial_parameters,
+    load_prompts,
+    print_memory_usage,
+)
+
+# Override heretic's rich print with plain print for pipeline logging
+import builtins
+_real_print = builtins.print
+from heretic import utils as _hu
+_hu.print = _real_print
+
+torch.set_grad_enabled(False)
+torch._dynamo.config.cache_size_limit = 64
+transformers.logging.set_verbosity_error()
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings("ignore", category=ExperimentalWarning)
+
+model_path = "{artifacts.merged_dir}"
+output_path = "{heretic_output}"
+checkpoint_dir = "{checkpoint_dir}"
+
+_real_print(f"Model: {{model_path}}")
+_real_print(f"Output: {{output_path}}")
+
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# Create Settings programmatically (bypasses CLI arg parsing)
+settings = Settings(
+    model=model_path,
+    quantization="{hc.quantization}",
+    n_trials={hc.n_trials},
+    n_startup_trials={hc.n_startup_trials},
+    kl_divergence_scale={hc.kl_divergence_scale},
+    orthogonalize_direction={hc.orthogonalize_direction},
+    row_normalization="{hc.row_normalization}",
+    study_checkpoint_dir=checkpoint_dir,
+    batch_size=0,
+)
+
+model = Model(settings)
+_real_print()
+print_memory_usage()
+
+_real_print()
+_real_print(f"Loading good prompts from {{settings.good_prompts.dataset}}...")
+good_prompts = load_prompts(settings, settings.good_prompts)
+_real_print(f"  {{len(good_prompts)}} prompts loaded")
+
+_real_print()
+_real_print(f"Loading bad prompts from {{settings.bad_prompts.dataset}}...")
+bad_prompts = load_prompts(settings, settings.bad_prompts)
+_real_print(f"  {{len(bad_prompts)}} prompts loaded")
+
+# Auto batch size
+if settings.batch_size == 0:
+    _real_print()
+    _real_print("Determining optimal batch size...")
+    batch_size = 1
+    best_batch_size = -1
+    best_performance = -1
+    while batch_size <= settings.max_batch_size:
+        _real_print(f"  Trying batch size {{batch_size}}... ", end="")
+        prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
+        prompts = prompts[:batch_size]
+        try:
+            model.get_responses(prompts)
+            start_time = time.perf_counter()
+            responses = model.get_responses(prompts)
+            end_time = time.perf_counter()
+        except Exception as error:
+            if batch_size == 1:
+                raise
+            _real_print(f"Failed ({{error}})")
+            break
+        response_lengths = [len(model.tokenizer.encode(r)) for r in responses]
+        performance = sum(response_lengths) / (end_time - start_time)
+        _real_print(f"Ok ({{performance:.0f}} tokens/s)")
+        if performance > best_performance:
+            best_batch_size = batch_size
+            best_performance = performance
+        batch_size *= 2
+    settings.batch_size = best_batch_size
+    _real_print(f"  Chosen batch size: {{settings.batch_size}}")
+
+# Check for common response prefix
+_real_print()
+_real_print("Checking for common response prefix...")
+from os.path import commonprefix
+responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
+model.response_prefix = commonprefix(responses).rstrip(" ")
+if model.response_prefix.startswith("<think>"):
+    model.response_prefix = "<think></think>"
+elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
+    model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+elif model.response_prefix.startswith("<thought>"):
+    model.response_prefix = "<thought></thought>"
+elif model.response_prefix.startswith("[THINK]"):
+    model.response_prefix = "[THINK][/THINK]"
+if model.response_prefix:
+    _real_print(f"  Prefix found: {{model.response_prefix!r}}")
+else:
+    _real_print("  None found")
+
+evaluator = Evaluator(settings, model)
+
+# Compute refusal directions
+_real_print()
+_real_print("Calculating per-layer refusal directions...")
+_real_print("  Obtaining residuals for good prompts...")
+good_residuals = model.get_residuals_batched(good_prompts)
+_real_print("  Obtaining residuals for bad prompts...")
+bad_residuals = model.get_residuals_batched(bad_prompts)
+
+good_means = good_residuals.mean(dim=0)
+bad_means = bad_residuals.mean(dim=0)
+refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+
+if settings.orthogonalize_direction:
+    good_directions = F.normalize(good_means, p=2, dim=1)
+    projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+    refusal_directions = refusal_directions - projection_vector.unsqueeze(1) * good_directions
+    refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+
+del good_residuals, bad_residuals
+empty_cache()
+
+# Set up Optuna study
+study_checkpoint_file = os.path.join(
+    checkpoint_dir,
+    "".join([(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]) + ".jsonl",
+)
+lock_obj = JournalFileOpenLock(study_checkpoint_file)
+backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
+storage = JournalStorage(backend)
+
+trial_index = 0
+start_index = 0
+start_time = time.perf_counter()
+
+def objective(trial):
+    global trial_index
+    trial_index += 1
+    trial.set_user_attr("index", trial_index)
+
+    direction_scope = trial.suggest_categorical("direction_scope", ["global", "per layer"])
+    last_layer_index = len(model.get_layers()) - 1
+    direction_index = trial.suggest_float("direction_index", 0.4 * last_layer_index, 0.9 * last_layer_index)
+    if direction_scope == "per layer":
+        direction_index = None
+
+    parameters = {{}}
+    for component in model.get_abliterable_components():
+        max_weight = trial.suggest_float(f"{{component}}.max_weight", 0.8, 1.5)
+        max_weight_position = trial.suggest_float(f"{{component}}.max_weight_position", 0.6 * last_layer_index, 1.0 * last_layer_index)
+        min_weight = trial.suggest_float(f"{{component}}.min_weight", 0.0, 1.0)
+        min_weight_distance = trial.suggest_float(f"{{component}}.min_weight_distance", 1.0, 0.6 * last_layer_index)
+        parameters[component] = AbliterationParameters(
+            max_weight=max_weight,
+            max_weight_position=max_weight_position,
+            min_weight=(min_weight * max_weight),
+            min_weight_distance=min_weight_distance,
+        )
+
+    trial.set_user_attr("direction_index", direction_index)
+    trial.set_user_attr("parameters", {{k: asdict(v) for k, v in parameters.items()}})
+
+    _real_print(f"\\nRunning trial {{trial_index}} of {{settings.n_trials}}...")
+    _real_print("  Resetting model...")
+    model.reset_model()
+    _real_print("  Abliterating...")
+    model.abliterate(refusal_directions, direction_index, parameters)
+    _real_print("  Evaluating...")
+    score, kl_divergence, refusals = evaluator.get_score()
+
+    elapsed = time.perf_counter() - start_time
+    remaining = (elapsed / (trial_index - start_index)) * (settings.n_trials - trial_index)
+    _real_print(f"  Elapsed: {{format_duration(elapsed)}}")
+    if trial_index < settings.n_trials:
+        _real_print(f"  Estimated remaining: {{format_duration(remaining)}}")
+
+    trial.set_user_attr("kl_divergence", kl_divergence)
+    trial.set_user_attr("refusals", refusals)
+    return score
+
+def objective_wrapper(trial):
+    try:
+        return objective(trial)
+    except KeyboardInterrupt:
+        trial.study.stop()
+        raise TrialPruned()
+
+study = optuna.create_study(
+    sampler=TPESampler(n_startup_trials=settings.n_startup_trials, n_ei_candidates=128, multivariate=True),
+    directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+    storage=storage,
+    study_name="heretic",
+    load_if_exists=True,
+)
+study.set_user_attr("settings", settings.model_dump_json())
+study.set_user_attr("finished", False)
+
+def count_completed():
+    return sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
+
+start_index = trial_index = count_completed()
+if start_index > 0:
+    _real_print(f"\\nResuming existing study ({{start_index}} trials completed).")
+
+remaining_trials = settings.n_trials - count_completed()
+if remaining_trials > 0:
+    study.optimize(objective_wrapper, n_trials=remaining_trials)
+
+if count_completed() == settings.n_trials:
+    study.set_user_attr("finished", True)
+
+# Select best trial from Pareto front (lowest refusals, then lowest KL divergence)
+completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+if not completed_trials:
+    _real_print("No completed trials — abliteration failed")
+    sys.exit(1)
+
+sorted_trials = sorted(
+    completed_trials,
+    key=lambda t: (t.user_attrs["refusals"], t.user_attrs["kl_divergence"]),
+)
+min_divergence = math.inf
+best_trials = []
+for t in sorted_trials:
+    kl = t.user_attrs["kl_divergence"]
+    if kl < min_divergence:
+        min_divergence = kl
+        best_trials.append(t)
+
+# Pick the trial with fewest refusals and acceptable KL divergence
+best = best_trials[0]
+_real_print(f"\\nSelected trial {{best.user_attrs['index']}}: "
+            f"refusals={{best.user_attrs['refusals']}}, "
+            f"KL divergence={{best.user_attrs['kl_divergence']:.4f}}")
+
+# Apply the best trial
+_real_print("Resetting model...")
+model.reset_model()
+_real_print("Abliterating with best parameters...")
+model.abliterate(
+    refusal_directions,
+    best.user_attrs["direction_index"],
+    {{k: AbliterationParameters(**v) for k, v in best.user_attrs["parameters"].items()}},
+)
+
+# Save the merged model
+_real_print("Saving merged abliterated model...")
+merged_model = model.get_merged_model()
+merged_model.save_pretrained(output_path)
+del merged_model
+empty_cache()
+model.tokenizer.save_pretrained(output_path)
+
+_real_print(f"Abliterated model saved to {{output_path}}")
+_real_print("PIPELINE_STAGE_COMPLETE=heretic")
+'''
+
+    script_path = artifacts.output_dir / "_stage_heretic.py"
+    script_path.write_text(script)
+
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(Path.cwd()))
+    if rc != 0:
+        log(f"Heretic failed (exit code {rc})", "error")
+        return False
+
+    if not artifacts.heretic_dir.exists():
+        log("Heretic output directory not found", "error")
+        return False
+
+    log(f"Abliterated model saved to {artifacts.heretic_dir}", "success")
+    return True
+
+
 # ── Stage: MagicQuant ────────────────────────────────────────────────────────
 
 def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
@@ -478,8 +827,11 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -
     """
     log("Starting MagicQuant evolutionary quantization", "stage")
 
-    # Determine source: prefer merged safetensors, fall back to GGUF
-    if artifacts.merged_dir.exists():
+    # Determine source: prefer heretic output, then merged safetensors, fall back to GGUF
+    if artifacts.heretic_dir.exists():
+        source_path = str(artifacts.heretic_dir)
+        log(f"Source: abliterated model at {source_path}")
+    elif artifacts.merged_dir.exists():
         source_path = str(artifacts.merged_dir)
         log(f"Source: merged safetensors at {source_path}")
     elif artifacts.bf16_gguf.exists():
@@ -622,6 +974,7 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
 STAGES = [
     ("training",   stage_training),
     ("export",     stage_export),
+    ("heretic",    stage_heretic),
     ("magicquant", stage_magicquant),
     ("upload",     stage_upload),
 ]
@@ -637,6 +990,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
         enabled.add("training")
     if config.export is not None:
         enabled.add("export")
+    if config.heretic is not None:
+        enabled.add("heretic")
     if config.magicquant is not None:
         enabled.add("magicquant")
     if config.upload is not None:
@@ -670,6 +1025,11 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str)
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--no-export", action="store_true")
+    parser.add_argument("--heretic", action="store_true", help="Enable heretic abliteration stage")
+    parser.add_argument("--no-heretic", action="store_true", help="Disable heretic abliteration stage")
+    parser.add_argument("--heretic-trials", type=int, default=200, help="Heretic Optuna trials")
+    parser.add_argument("--heretic-quantization", type=str, default="bnb_4bit",
+                        help="Heretic model quantization (none or bnb_4bit)")
     parser.add_argument("--no-magicquant", action="store_true")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
@@ -693,6 +1053,13 @@ if __name__ == "__main__":
         cfg.training.dataset_path = args.dataset
     if args.no_export:
         cfg.export = None
+    if args.heretic and not args.no_heretic:
+        cfg.heretic = HereticConfig(
+            n_trials=args.heretic_trials,
+            quantization=args.heretic_quantization,
+        )
+    if args.no_heretic:
+        cfg.heretic = None
     if args.no_magicquant:
         cfg.magicquant = None
     if args.upload_to:

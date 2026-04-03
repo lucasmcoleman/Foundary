@@ -214,6 +214,14 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <label class="toggle"><input type="checkbox" checked onchange="toggleStage('export',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
         </div>
       </div>
+      <div class="stage-item" data-stage="heretic" data-status="pending" onclick="selectStage('heretic')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">Heretic</div>
+        <div class="stage-desc">Abliteration (remove safety alignment)</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" onchange="toggleStage('heretic',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
       <div class="stage-item" data-stage="magicquant" data-status="pending" onclick="selectStage('magicquant')">
         <div class="stage-indicator"></div>
         <div class="stage-name">MagicQuant</div>
@@ -351,6 +359,7 @@ const S = {
       output_dir: './output',
     },
     export: { gguf_type: 'bf16', also_save_merged: false, source_model: '' },
+    heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
     upload: { repo_id: '', private: true, license: 'apache-2.0', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -570,7 +579,7 @@ function toggleStage(name, on) {
  * Binds data-key inputs to S.config and persists changes to localStorage.
  */
 function renderStageContent() {
-  const r = {training: renderTraining, export: renderExport, magicquant: renderMagicQuant, upload: renderUpload};
+  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, magicquant: renderMagicQuant, upload: renderUpload};
   const container = document.getElementById('stage-content');
   if (!container) return;
   container.innerHTML = (r[S.selectedStage] || (() => ''))();
@@ -651,7 +660,8 @@ function suggestRepoId() {
   }
   let short = modelName.includes('/') ? modelName.split('/').pop() : modelName;
   short = short.replace(/\.(gguf|bin|safetensors)$/i, '');
-  const suffix = hasMQ ? '-MagicQuant-GGUF' : exportOn ? '-GGUF' : '-LoRA';
+  const hasHeretic = S.enabledStages.has('heretic');
+  const suffix = hasMQ ? '-MagicQuant-GGUF' : hasHeretic ? '-heretic' : exportOn ? '-GGUF' : '-LoRA';
   const prefix = S.hfUsername ? S.hfUsername + '/' : '';
   return prefix + short + suffix;
 }
@@ -723,6 +733,29 @@ function renderExport() {
     <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="export.also_save_merged" ${c.also_save_merged?'checked':''}><span class="form-label" data-tip="Save a copy of the merged model in HuggingFace safetensors format. Useful if you want to upload the full-precision model or use it with other tools." style="margin:0">Also save merged HF safetensors</span></label></div>
   </div>
   <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Export</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
+/** @returns {string} HTML for the Heretic (abliteration) configuration panel. */
+function renderHeretic() {
+  const c = S.config.heretic;
+  const on = S.enabledStages.has('heretic');
+  const exportOn = S.enabledStages.has('export');
+  return `
+  <div class="section-header"><div class="section-title">Heretic Abliteration</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('heretic', 'Heretic Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${!exportOn ? depBanner('warn', 'Export is disabled. Heretic requires a merged safetensors model in the output directory from a previous Export run.') : ''}
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">Removes safety alignment from the model via Optuna-optimized directional ablation. Uses the heretic-llm library to find and subtract refusal directions from model weights. The output is a standard HuggingFace safetensors model that feeds into MagicQuant.</div>
+  <div class="form-grid">
+    <div class="form-group">${L('Optuna Trials','Number of abliteration parameter combinations to try. More trials = better optimization but longer runtime. 100-200 recommended.')}<input class="form-input" type="number" data-key="heretic.n_trials" value="${c.n_trials}"></div>
+    <div class="form-group">${L('Startup Trials','Number of random exploration trials before Optuna starts optimizing. Higher = broader initial search. 40-80 typical.')}<input class="form-input" type="number" data-key="heretic.n_startup_trials" value="${c.n_startup_trials}"></div>
+    <div class="form-group">${L('Quantization','How to load the model for abliteration. bnb_4bit reduces VRAM usage significantly. Use none for full precision if VRAM allows.')}<select class="form-input" data-key="heretic.quantization"><option value="bnb_4bit" ${c.quantization==='bnb_4bit'?'selected':''}>bnb_4bit (low VRAM)</option><option value="none" ${c.quantization==='none'?'selected':''}>none (full precision)</option></select></div>
+    <div class="form-group">${L('KL Divergence Scale','Assumed typical KL divergence value for balancing optimization. Higher = more tolerance for capability degradation. Default 1.0.')}<input class="form-input" type="number" step="0.1" data-key="heretic.kl_divergence_scale" value="${c.kl_divergence_scale}"></div>
+    <div class="form-group">${L('Row Normalization','Weight normalization strategy. none = standard ablation. pre/full = experimental norm-preserving approaches.')}<select class="form-input" data-key="heretic.row_normalization"><option value="none" ${c.row_normalization==='none'?'selected':''}>none</option><option value="pre" ${c.row_normalization==='pre'?'selected':''}>pre</option><option value="full" ${c.row_normalization==='full'?'selected':''}>full</option></select></div>
+    <div class="form-group"><label class="checkbox-row"><input type="checkbox" data-key="heretic.orthogonalize_direction" ${c.orthogonalize_direction?'checked':''}><span class="form-label" data-tip="Adjust refusal directions to only subtract the component orthogonal to the good direction. Can preserve more model capability at the cost of slightly less effective abliteration." style="margin:0">Orthogonalize direction</span></label></div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">Heretic</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
   </div>`;
 }
 
@@ -851,6 +884,7 @@ async function runPipeline() {
   const payload = {
     training: S.config.training,
     export: S.config.export,
+    heretic: S.config.heretic,
     magicquant: S.config.magicquant,
     upload: S.config.upload,
     enabled_stages: enabled,

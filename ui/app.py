@@ -28,6 +28,7 @@ from config import settings as foundry_settings
 from services import (
     TrainingService,
     ExportService,
+    HereticService,
     MagicQuantService,
     UploadService,
 )
@@ -66,7 +67,7 @@ class StageStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-ALL_STAGES = ["training", "export", "magicquant", "upload"]
+ALL_STAGES = ["training", "export", "heretic", "magicquant", "upload"]
 
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
@@ -130,6 +131,14 @@ class ExportCfg(BaseModel):
     also_save_merged: bool = False
     source_model: str = ""  # when training is skipped: HF ID or local path to model/lora
 
+class HereticCfg(BaseModel):
+    n_trials: int = 200
+    n_startup_trials: int = 60
+    quantization: str = "bnb_4bit"
+    kl_divergence_scale: float = 1.0
+    orthogonalize_direction: bool = False
+    row_normalization: str = "none"
+
 class MagicQuantCfg(BaseModel):
     target_base_quant: str = "MXFP4_MOE"
     generations: int = 50
@@ -150,6 +159,7 @@ class UploadCfg(BaseModel):
 class RunRequest(BaseModel):
     training: TrainingCfg = TrainingCfg()
     export: Optional[ExportCfg] = ExportCfg()
+    heretic: Optional[HereticCfg] = None
     magicquant: Optional[MagicQuantCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
@@ -431,6 +441,53 @@ async def do_export(cfg: RunRequest) -> bool:
     return ok
 
 
+async def do_heretic(cfg: RunRequest) -> bool:
+    """Run heretic abliteration on the merged model to remove safety alignment."""
+    out = cfg.training.output_dir
+    out_abs = _resolve_out(out)
+    hc = cfg.heretic
+
+    # Skip if heretic output already exists
+    heretic_dir = out_abs / "heretic_model"
+    if heretic_dir.exists() and any(heretic_dir.glob("*.safetensors")):
+        await state.log(f"Abliterated model already exists at {heretic_dir} -- skipping heretic", "success")
+        await state.set_stage("heretic", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
+
+    # Determine model source: prefer merged_model from export stage
+    merged_dir = out_abs / "merged_model"
+    if not merged_dir.exists() or not any(merged_dir.glob("*.safetensors")):
+        await state.log("No merged model found -- run export first", "error")
+        await state.set_stage("heretic", StageStatus.FAILED)
+        return False
+
+    await state.set_stage("heretic", StageStatus.RUNNING)
+    await state.set_progress(0)
+    await state.log("Starting heretic abliteration (Optuna-optimized directional ablation)", "stage")
+
+    checkpoint_dir = str(out_abs / "_heretic_checkpoints")
+
+    svc = HereticService(FOUNDRY_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        model_path=str(merged_dir),
+        output_path=str(heretic_dir),
+        checkpoint_dir=checkpoint_dir,
+        n_trials=hc.n_trials,
+        n_startup_trials=hc.n_startup_trials,
+        quantization=hc.quantization,
+        kl_divergence_scale=hc.kl_divergence_scale,
+        orthogonalize_direction=hc.orthogonalize_direction,
+        row_normalization=hc.row_normalization,
+    )
+    rc = await run_script(script, out)
+    ok = rc == 0
+    await state.set_stage("heretic", StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
+
+
 async def do_magicquant(cfg: RunRequest) -> bool:
     """Run MagicQuant evolutionary search and generate tiered hybrid GGUFs."""
     out = cfg.training.output_dir
@@ -549,6 +606,7 @@ async def do_upload(cfg: RunRequest) -> bool:
 STAGE_RUNNERS = {
     "training":   do_training,
     "export":     do_export,
+    "heretic":    do_heretic,
     "magicquant": do_magicquant,
     "upload":     do_upload,
 }
@@ -566,6 +624,15 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
                             "Provide a HuggingFace model ID or local path in the Export config.", "error")
             return False
         await state.log(f"Training skipped — Export will use source model: {source}")
+
+    # Heretic without export: needs merged model from prior run
+    if "heretic" in enabled and "export" not in enabled:
+        has_merged = (out_abs / "merged_model").exists()
+        if not has_merged:
+            await state.log("Heretic is enabled without Export, and no merged model was found "
+                            "in the output directory. Enable Export to produce a merged model first.", "error")
+            return False
+        await state.log(f"Export skipped -- Heretic will use existing: {out_abs}/merged_model")
 
     # MagicQuant without export: needs a source
     if "magicquant" in enabled and "export" not in enabled:
