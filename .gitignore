@@ -13,6 +13,9 @@ build/
 # Output directories (model artifacts)
 output/
 
+# Training data
+data/
+
 # Embedded MagicQuant (has its own repo at ../MagicQuant/)
 MagicQuant/
 
