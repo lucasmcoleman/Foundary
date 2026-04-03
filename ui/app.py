@@ -570,6 +570,7 @@ async def do_upload(cfg: RunRequest) -> bool:
     tc = cfg.training
     out_abs = _resolve_out(out)
 
+    enabled = set(cfg.enabled_stages)
     svc = UploadService(FOUNDRY_ROOT, VENV_PYTHON)
     script = svc.build_script(
         repo_id=uc.repo_id,
@@ -581,6 +582,9 @@ async def do_upload(cfg: RunRequest) -> bool:
         upload_dataset=uc.upload_dataset,
         base_model=tc.model_name,
         dataset_name=tc.dataset_path,
+        did_training="training" in enabled,
+        did_heretic="heretic" in enabled,
+        did_magicquant="magicquant" in enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,

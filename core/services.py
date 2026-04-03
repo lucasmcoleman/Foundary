@@ -665,6 +665,9 @@ class UploadService:
         upload_dataset: bool,
         base_model: str,
         dataset_name: str,
+        did_training: bool = True,
+        did_heretic: bool = False,
+        did_magicquant: bool = True,
         lora_r: int,
         lora_alpha: int,
         lora_dropout: float,
@@ -693,6 +696,9 @@ class UploadService:
             f"    upload_dataset={upload_dataset},\n"
             f"    base_model={repr(base_model)},\n"
             f"    dataset_name={repr(dataset_name)},\n"
+            f"    did_training={did_training},\n"
+            f"    did_heretic={did_heretic},\n"
+            f"    did_magicquant={did_magicquant},\n"
             f"    lora_r={lora_r},\n"
             f"    lora_alpha={lora_alpha},\n"
             f"    lora_dropout={lora_dropout},\n"

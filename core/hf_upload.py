@@ -51,6 +51,11 @@ class HFUploadConfig:
     dataset_name: str = ""
     model_description: str = ""
 
+    # Pipeline stages that were actually run (for conditional card sections)
+    did_training: bool = True
+    did_heretic: bool = False
+    did_magicquant: bool = True
+
     # Training details (for the model card)
     lora_r: int = 32
     lora_alpha: int = 64
@@ -155,20 +160,43 @@ def generate_model_card(
             size_mb = local_path.stat().st_size / 1e6
             other_rows += f"| {repo_path} | {size_mb:.0f} MB |\n"
 
-    # Description
+    # Build a dynamic description based on which pipeline stages ran
     description = cfg.model_description
     if not description:
-        description = (
-            f"Fine-tuned GGUF quantization of [{base_model_short}](https://huggingface.co/{base_model}), "
-            f"trained on {dataset_name} with QLoRA and quantized using MagicQuant hybrid evolutionary search."
-        )
+        parts = []
+        if cfg.did_training:
+            parts.append(f"fine-tuned on {dataset_name} with QLoRA")
+        if cfg.did_heretic:
+            parts.append("abliterated with [Heretic](https://github.com/p-e-w/heretic) for uncensored responses")
+        if cfg.did_magicquant:
+            parts.append("quantized using MagicQuant hybrid evolutionary per-tensor search")
+        elif has_gguf:
+            parts.append("exported to GGUF format")
+
+        if parts:
+            actions = ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1] if len(parts) > 1 else parts[0]
+            description = (
+                f"Derivative of [{base_model_short}](https://huggingface.co/{base_model}), "
+                f"{actions}."
+            )
+        else:
+            description = f"Derivative of [{base_model_short}](https://huggingface.co/{base_model})."
 
     # Build effective batch size
     effective_batch = cfg.batch_size * cfg.gradient_accumulation
 
-    # YAML front matter — built manually because ModelCardData.to_yaml()
-    # doesn't support all the fields we need.
-    tags = ["gguf", "quantized", "fine-tuned", "magicquant", "qlora"]
+    # Dynamic tags based on pipeline stages
+    tags = []
+    if has_gguf:
+        tags.append("gguf")
+    if cfg.did_magicquant:
+        tags.extend(["quantized", "magicquant"])
+    if cfg.did_training:
+        tags.extend(["fine-tuned", "qlora"])
+    if cfg.did_heretic:
+        tags.extend(["abliterated", "uncensored", "heretic"])
+    if not tags:
+        tags = ["gguf"]
     tags_yaml = "\n".join(f"  - {t}" for t in tags)
 
     # Determine quantization types from GGUF filenames for metadata
@@ -180,20 +208,22 @@ def generate_model_card(
                 if qt in name:
                     quant_types.add(qt.upper())
 
-    # If training was done (non-zero epochs, has LoRA config), it's a fine-tune.
-    # If only quantization was done, it's a quantized version.
-    is_finetune = cfg.num_epochs > 0 and cfg.lora_r > 0
+    is_finetune = cfg.did_training and cfg.num_epochs > 0 and cfg.lora_r > 0
     base_model_relation = "finetune" if is_finetune else "quantized"
+
+    # Dynamic library_name and quantized_by
+    library_name = "llama.cpp" if has_gguf else "transformers"
+    quantized_by = "MagicQuant" if cfg.did_magicquant else ""
 
     yaml_block = f"""---
 license: {cfg.license}
-library_name: llama.cpp
+library_name: {library_name}
 base_model:
   - {base_model}
 base_model_relation: {base_model_relation}
 {"datasets:" + chr(10) + "  - " + dataset_repo_id if dataset_repo_id else ""}
 pipeline_tag: text-generation
-quantized_by: MagicQuant
+{"quantized_by: " + quantized_by if quantized_by else ""}
 language:
   - en
 tags:
@@ -218,19 +248,36 @@ tags:
 |------|------|
 {other_rows}"""
 
-    card = f"""{yaml_block}
+    # ── Build the card body with conditional sections ──
 
-# {repo_name}
+    body_sections = []
 
-{description}
+    # Header
+    body_sections.append(f"# {repo_name}\n\n{description}")
 
-## Base Model
+    # Base model credit (always)
+    body_sections.append(f"""## Base Model
 
-This is a fine-tuned and quantized derivative of [{base_model_short}](https://huggingface.co/{base_model}).
+This is a derivative of [{base_model_short}](https://huggingface.co/{base_model}).
 All credit for the base model architecture and weights goes to the original authors.
-The base model's license applies to this derivative.
+The base model's license applies to this derivative.""")
 
-## Quantization Method
+    # Heretic section (only if abliteration was applied)
+    if cfg.did_heretic:
+        body_sections.append("""## Abliteration (Heretic)
+
+Safety alignment has been removed using **[Heretic](https://github.com/p-e-w/heretic)** directional ablation:
+
+- A "refusal direction" is identified in each transformer layer's residual stream
+- The model's projection matrices are orthogonalized with respect to that direction
+- An Optuna TPE optimizer automatically tunes all ablation parameters
+- The result is a model that responds to all prompts without refusal behavior
+
+**This model will comply with any request.** Use responsibly.""")
+
+    # MagicQuant section (only if quantized with MagicQuant)
+    if cfg.did_magicquant:
+        body_sections.append("""## Quantization Method
 
 Quantized using **[MagicQuant](https://github.com/lucasmcoleman/MagicQuant)** hybrid evolutionary per-tensor quantization,
 based on the methodology by **[magiccodingman](https://github.com/magiccodingman/MagicQuant-Wiki)**:
@@ -239,9 +286,12 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
 - An evolutionary search finds the optimal quantization type per group, balancing size vs. perplexity
 - **Q4/Q5/Q6 tier targets** are produced with different size-quality tradeoffs
 - Small-row tensors and sensitivity-critical layers (embeddings, output head, router) are kept at F32/F16/BF16
-- This is NOT a uniform quantization -- each tensor group gets its own optimal type
+- This is NOT a uniform quantization -- each tensor group gets its own optimal type""")
 
-## Training Details
+    # Training details (only if training was done)
+    if cfg.did_training:
+        dataset_link = f"[{Path(dataset_name).stem}](https://huggingface.co/datasets/{dataset_repo_id})" if dataset_repo_id else dataset_name
+        body_sections.append(f"""## Training Details
 
 | Parameter | Value |
 |-----------|-------|
@@ -256,16 +306,20 @@ based on the methodology by **[magiccodingman](https://github.com/magiccodingman
 | Optimizer | {cfg.optimizer} |
 | Training sequence length | {cfg.max_seq_length} |
 | Precision | BF16 |
-| Dataset | {f"[{Path(dataset_name).stem}](https://huggingface.co/datasets/{dataset_repo_id})" if dataset_repo_id else dataset_name} |
+| Dataset | {dataset_link} |
 | Hardware | AMD Ryzen AI Max+ 395 (Strix Halo), 128 GB unified memory (GTT), ROCm |
-| Training pipeline | Custom fast QLoRA with shard-by-shard BnB 4-bit quantization |
 
 **Completion-only loss**: Only assistant response turns contribute to the training loss.
 System and user turns are masked, so the model learns to generate responses rather
-than memorizing prompts.
-{files_section}
+than memorizing prompts.""")
 
-## Usage
+    # Files section
+    if files_section:
+        body_sections.append(files_section.strip())
+
+    # Usage section (only if GGUF files present)
+    if has_gguf:
+        body_sections.append(f"""## Usage
 
 ### LM Studio
 
@@ -299,27 +353,45 @@ output = llm.create_chat_completion(
     ]
 )
 print(output["choices"][0]["message"]["content"])
-```
+```""")
 
-## Caveats
+    # Caveats (dynamic)
+    caveats = []
+    caveats.append(f"- The base model's license ({cfg.license}) applies to all derivative files")
+    if cfg.did_training:
+        caveats.append("- This is a **personal fine-tune**, not an official release from the base model authors")
+        caveats.append("- Quality depends on the training data and may not generalize to all tasks")
+    if cfg.did_heretic:
+        caveats.append("- **Safety alignment has been removed** -- this model may produce harmful, offensive, or dangerous content")
+        caveats.append("- The abliteration process may slightly degrade model quality on some benchmarks")
+    if cfg.did_magicquant or has_gguf:
+        caveats.append("- Quantization reduces precision -- verify outputs for your specific use case")
+    if cfg.did_magicquant:
+        caveats.append("- The hybrid quantization assigns different precision to different tensor groups, which means quality characteristics may differ from uniform quantizations")
+    body_sections.append("## Caveats\n\n" + "\n".join(caveats))
 
-- This is a **personal fine-tune**, not an official release from the base model authors
-- The base model's license ({cfg.license}) applies to all derivative files
-- Quality depends on the training data and may not generalize to all tasks
-- Quantization reduces precision -- verify outputs for your specific use case
-- The hybrid quantization assigns different precision to different tensor groups,
-  which means quality characteristics may differ from uniform quantizations
+    # Limitations (dynamic)
+    limitations = []
+    if cfg.did_training:
+        limitations.append(f"- Training data used sequences up to {cfg.max_seq_length} tokens; the model retains the base model's full context window")
+        limitations.append("- Performance on tasks not represented in the training data may be degraded")
+    if cfg.did_magicquant or has_gguf:
+        limitations.append("- Quantized models may exhibit subtle differences from the full-precision fine-tune")
+    limitations.append("- This model inherits any limitations and biases present in the base model")
+    body_sections.append("## Limitations\n\n" + "\n".join(limitations))
 
-## Limitations
+    # Pipeline credit
+    pipeline_parts = []
+    if cfg.did_training:
+        pipeline_parts.append("[Foundry](https://github.com/lucasmcoleman/Foundry)")
+    if cfg.did_heretic:
+        pipeline_parts.append("[Heretic](https://github.com/p-e-w/heretic)")
+    if cfg.did_magicquant:
+        pipeline_parts.append("[MagicQuant](https://github.com/lucasmcoleman/MagicQuant)")
+    body_sections.append("---\n*Generated with " + " + ".join(pipeline_parts or ["Foundry"]) + "*")
 
-- Training data used sequences up to {cfg.max_seq_length} tokens; the model retains the base model's full context window
-- Performance on tasks not represented in the training data may be degraded
-- Quantized models may exhibit subtle differences from the full-precision fine-tune
-- This model inherits any limitations and biases present in the base model
-
----
-*Generated with the MagicQuant Pipeline*
-"""
+    body = "\n\n".join(body_sections)
+    card = f"{yaml_block}\n\n{body}\n"
     return card
 
 
