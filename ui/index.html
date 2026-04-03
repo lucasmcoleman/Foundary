@@ -401,6 +401,10 @@ function restoreFormState() {
           Object.assign(S.config[section], data.config[section]);
         }
       }
+      // Fix stale defaults from older versions
+      if (S.config.training.dataset_path === 'zeroclaw_training_data.jsonl') {
+        S.config.training.dataset_path = 'data/zeroclaw_training_data.jsonl';
+      }
     }
     if (data.enabledStages) {
       S.enabledStages = new Set(data.enabledStages);
