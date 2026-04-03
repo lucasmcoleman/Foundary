@@ -369,6 +369,9 @@ const S = {
 
 // ── localStorage Form Persistence ──────────────────────────────────────────
 const LS_KEY = 'foundry_form_state';
+// Bump this when defaults change. Mismatched versions discard saved state
+// so users pick up corrected defaults instead of perpetuating stale values.
+const LS_VERSION = 2;
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -377,6 +380,7 @@ const LS_KEY = 'foundry_form_state';
 function saveFormState() {
   try {
     const data = {
+      version: LS_VERSION,
       config: S.config,
       enabledStages: Array.from(S.enabledStages),
       selectedStage: S.selectedStage,
@@ -387,23 +391,28 @@ function saveFormState() {
 
 /**
  * Restore form config and enabled stages from localStorage on page load.
- * Falls back to defaults if nothing is saved or data is corrupt.
+ * Discards saved state if the schema version doesn't match (defaults changed).
  */
 function restoreFormState() {
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return;
     const data = JSON.parse(raw);
+    // Version mismatch: discard stale state so new defaults take effect
+    if (data.version !== LS_VERSION) {
+      localStorage.removeItem(LS_KEY);
+      return;
+    }
     if (data.config) {
-      // Deep-merge each section to preserve new defaults for keys not in stored data
       for (const section of Object.keys(S.config)) {
-        if (data.config[section]) {
-          Object.assign(S.config[section], data.config[section]);
+        if (!data.config[section]) continue;
+        const saved = data.config[section];
+        const defaults = S.config[section];
+        for (const key of Object.keys(saved)) {
+          if (key in defaults) {
+            defaults[key] = saved[key];
+          }
         }
-      }
-      // Fix stale defaults from older versions
-      if (S.config.training.dataset_path === 'zeroclaw_training_data.jsonl') {
-        S.config.training.dataset_path = 'data/zeroclaw_training_data.jsonl';
       }
     }
     if (data.enabledStages) {
