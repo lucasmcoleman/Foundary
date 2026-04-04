@@ -254,16 +254,27 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
             setattr(target, parts[-1], new_param)
             print(f"  Materialized {name} as zeros on {DEVICE}")
 
-    # Also handle any meta buffers
-    meta_bufs = [(n, b) for n, b in model.named_buffers() if b.device.type == "meta"]
-    for name, buf in meta_bufs:
+    # Move all buffers that aren't on GPU yet.
+    # This covers two cases:
+    #   1. Meta buffers: created by init_empty_weights(), not in safetensors
+    #   2. CPU buffers: computed during __init__ (e.g. RotaryEmbedding.inv_freq)
+    #      These have correct values but are on the wrong device.
+    offdevice_bufs = [(n, b) for n, b in model.named_buffers()
+                      if b.device.type != DEVICE.type]
+    if offdevice_bufs:
+        print(f"Moving {len(offdevice_bufs)} buffers to {DEVICE}...")
+    for name, buf in offdevice_bufs:
         parts = name.split(".")
         target = model
         for p in parts[:-1]:
             target = getattr(target, p)
-        new_buf = torch.zeros(buf.shape, device=DEVICE, dtype=buf.dtype)
+        if buf.device.type == "meta":
+            # Meta buffers have no data — materialize as zeros
+            new_buf = torch.zeros(buf.shape, device=DEVICE, dtype=buf.dtype)
+        else:
+            # CPU buffers have valid data (e.g. inv_freq) — just move
+            new_buf = buf.to(DEVICE)
         setattr(target, parts[-1], new_buf)
-        print(f"  Materialized buffer {name} on {DEVICE}")
 
     total_time = time.time() - total_t0
     gpu_mb = torch.cuda.memory_allocated() / 1e6
