@@ -211,23 +211,26 @@ async def run_script(script: str, output_dir: str) -> int:
                     text = text.strip()
                     if not text:
                         continue
-                    # Parse progress from any tqdm bar or shard-loading output.
-                    # Tqdm: "  5%|█         | 3/57 [00:15<04:30, 5.00s/it]"
-                    # Shard: "Done in 2.1s | Progress: 45/1275 (4%) | Total: 4s"
+                    # Parse progress from tqdm bars and shard-loading output.
+                    # Two phases: loading = 0-15%, training/processing = 15-100%.
+                    # Shard loading: "Done in 2.1s | Progress: 45/1275 (4%)"
+                    # Tqdm training: "  5%|█ | 3/57 [00:15<04:30, 5.00s/it]"
                     pct_parsed = False
-                    if "%|" in text:
+                    if "Progress:" in text and "%" in text:
                         try:
-                            pct = int(float(text.split("%|")[0].strip().split()[-1]))
-                            # Ignore "Fetching N files" — it's instant for cached models
-                            if "Fetching" not in text:
-                                await state.set_progress(pct)
+                            raw_pct = int(text.split("(")[1].split("%")[0])
+                            await state.set_progress(int(raw_pct * 0.15))
                             pct_parsed = True
                         except (ValueError, IndexError):
                             pass
-                    elif "Progress:" in text and "%" in text:
+                    elif "%|" in text:
                         try:
-                            pct = int(text.split("(")[1].split("%")[0])
-                            await state.set_progress(pct)
+                            raw_pct = int(float(text.split("%|")[0].strip().split()[-1]))
+                            if "Fetching" in text or "Map:" in text or "Tokenizing" in text:
+                                pass  # ignore quick preprocessing tqdm bars
+                            else:
+                                # Training/export tqdm: map 0-100% to 15-100%
+                                await state.set_progress(15 + int(raw_pct * 0.85))
                             pct_parsed = True
                         except (ValueError, IndexError):
                             pass
