@@ -331,7 +331,7 @@ def validate_dataset(dataset_path_or_sources, log: LogFn) -> bool:
 
     if all_ok:
         log("Dataset validation passed", "success")
-    return True
+    return all_ok
 
 
 # ── Improvement #4: Auto-install llama.cpp ───────────────────────────────────
@@ -392,8 +392,12 @@ def stage_training(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> 
     log("Starting QLoRA training (fast loader, completion-only loss)", "stage")
     tc = config.training
 
+    # Use the directory containing this file as the project root (not CWD).
+    _project_root = Path(__file__).resolve().parent.parent
+
     # Generate a training script that uses the custom fast loader.
     # This runs as a subprocess so GPU memory is fully freed when it exits.
+    # All string config values use repr() to prevent injection / quote breakage.
     script = f'''
 import os, re, gc, json, time
 os.environ["HSA_ENABLE_SDMA"] = "0"
@@ -409,11 +413,11 @@ from trl import SFTTrainer, SFTConfig
 # ── Fast model loading (shard-by-shard with inline BnB quantization) ──
 # Import and call the fast loader directly.
 import sys
-sys.path.insert(0, str(Path("{Path.cwd()}") / "core"))
+sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
 from fast_train_zeroclaw import fast_load_quantized_model, find_latest_checkpoint
 
 DEVICE = torch.device("cuda:0")
-model, tokenizer = fast_load_quantized_model("{tc.model_name}")
+model, tokenizer = fast_load_quantized_model({tc.model_name!r})
 
 # ── Attach LoRA adapters ──
 model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
@@ -437,7 +441,7 @@ for _src in _sources:
         continue
     _local = Path(_src)
     if not _local.is_absolute():
-        _local = Path("{Path.cwd()}") / _local
+        _local = Path({repr(str(_project_root))}) / _local
     if _local.exists():
         _ext = _local.suffix.lstrip(".")
         _fmt = {{"jsonl": "json", "json": "json", "csv": "csv", "parquet": "parquet"}}.get(_ext, "json")
@@ -478,14 +482,14 @@ dataset = dataset.map(fmt)
 # ── Training with completion-only loss ──
 # Only assistant turns contribute to the loss. System/user turns are masked.
 training_args = SFTConfig(
-    output_dir="{config.output_dir}",
+    output_dir={config.output_dir!r},
     num_train_epochs={tc.num_train_epochs},
     per_device_train_batch_size={tc.per_device_train_batch_size},
     gradient_accumulation_steps={tc.gradient_accumulation_steps},
     learning_rate={tc.learning_rate},
-    lr_scheduler_type="{tc.lr_scheduler_type}",
+    lr_scheduler_type={tc.lr_scheduler_type!r},
     warmup_ratio={tc.warmup_ratio},
-    optim="{tc.optim}",
+    optim={tc.optim!r},
     weight_decay=0.01, max_grad_norm=1.0,
     fp16=False, bf16=True,
     logging_steps=1, save_strategy="epoch", seed=42,
@@ -503,11 +507,11 @@ trainer = SFTTrainer(
 )
 
 # Resume from checkpoint if one exists (e.g. after crash or OOM).
-resume_ckpt = find_latest_checkpoint("{config.output_dir}")
+resume_ckpt = find_latest_checkpoint({config.output_dir!r})
 stats = trainer.train(resume_from_checkpoint=resume_ckpt)
 print(f"PIPELINE_TRAINING_LOSS={{stats.training_loss:.4f}}")
 
-lora_dir = "{artifacts.lora_dir}"
+lora_dir = {str(artifacts.lora_dir)!r}
 model.save_pretrained(lora_dir)
 tokenizer.save_pretrained(lora_dir)
 print("PIPELINE_STAGE_COMPLETE=training")
@@ -517,7 +521,7 @@ print("PIPELINE_STAGE_COMPLETE=training")
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
 
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(Path.cwd()))
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
     if rc != 0:
         log(f"Training failed (exit code {rc})", "error")
         return False
@@ -560,7 +564,11 @@ def stage_export(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
     else:
         base_model_id = config.training.model_name
 
+    # Use the directory containing this file as the project root (not CWD).
+    _project_root = Path(__file__).resolve().parent.parent
+
     # Generate an export script that uses the custom fast merge.
+    # All string config values use repr() to prevent injection / quote breakage.
     script = f'''
 import os, sys
 from pathlib import Path
@@ -568,13 +576,13 @@ os.environ["HSA_ENABLE_SDMA"] = "0"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
-sys.path.insert(0, str(Path("{Path.cwd()}") / "core"))
+sys.path.insert(0, str(Path({repr(str(_project_root))}) / "core"))
 from fast_export import streaming_merge
 
 streaming_merge(
-    model_id="{base_model_id}",
-    lora_dir="{artifacts.lora_dir}",
-    merged_dir="{artifacts.merged_dir}",
+    model_id={base_model_id!r},
+    lora_dir={str(artifacts.lora_dir)!r},
+    merged_dir={str(artifacts.merged_dir)!r},
 )
 print("PIPELINE_STAGE_COMPLETE=export")
 '''
@@ -582,7 +590,7 @@ print("PIPELINE_STAGE_COMPLETE=export")
     script_path = artifacts.output_dir / "_stage_export.py"
     script_path.write_text(script)
 
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(Path.cwd()))
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
     if rc != 0:
         log(f"Export failed (exit code {rc})", "error")
         return False
@@ -620,8 +628,12 @@ def stage_heretic(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> b
     heretic_output = str(artifacts.heretic_dir)
     checkpoint_dir = str(artifacts.output_dir / "_heretic_checkpoints")
 
+    # Use the directory containing this file as the project root (not CWD).
+    _project_root = Path(__file__).resolve().parent.parent
+
     # Build a self-contained script that uses heretic's internal API directly.
     # This bypasses all questionary interactive prompts in heretic's main.py.
+    # All string config values use repr() to prevent injection / quote breakage.
     script = f'''
 import math
 import os
@@ -669,9 +681,9 @@ transformers.logging.set_verbosity_error()
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=ExperimentalWarning)
 
-model_path = "{artifacts.merged_dir}"
-output_path = "{heretic_output}"
-checkpoint_dir = "{checkpoint_dir}"
+model_path = {str(artifacts.merged_dir)!r}
+output_path = {heretic_output!r}
+checkpoint_dir = {checkpoint_dir!r}
 
 _real_print(f"Model: {{model_path}}")
 _real_print(f"Output: {{output_path}}")
@@ -681,12 +693,12 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 # Create Settings programmatically (bypasses CLI arg parsing)
 settings = Settings(
     model=model_path,
-    quantization="{hc.quantization}",
+    quantization={hc.quantization!r},
     n_trials={hc.n_trials},
     n_startup_trials={hc.n_startup_trials},
     kl_divergence_scale={hc.kl_divergence_scale},
     orthogonalize_direction={hc.orthogonalize_direction},
-    row_normalization="{hc.row_normalization}",
+    row_normalization={hc.row_normalization!r},
     study_checkpoint_dir=checkpoint_dir,
     batch_size=0,
 )
@@ -916,7 +928,7 @@ _real_print("PIPELINE_STAGE_COMPLETE=heretic")
     script_path = artifacts.output_dir / "_stage_heretic.py"
     script_path.write_text(script)
 
-    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(Path.cwd()))
+    rc = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
     if rc != 0:
         log(f"Heretic failed (exit code {rc})", "error")
         return False
@@ -1016,11 +1028,17 @@ def _resolve_license(uc: UploadConfig, model_name: str, log: LogFn) -> str:
     return lic
 
 
-def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                 enabled: set = None) -> bool:
     """Upload artifacts to HuggingFace Hub.
 
     Delegates to hf_upload module for model card generation, progress
     reporting, and file upload. Supports dry-run mode via stage_upload_dry_run().
+
+    Args:
+        enabled: set of stage names that actually ran. Used to determine
+                 did_training / did_heretic / did_magicquant flags for the
+                 model card. Falls back to config presence check if not provided.
     """
     from hf_upload import HFUploadConfig, upload
 
@@ -1031,6 +1049,11 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
 
     tc = config.training
     license_id = _resolve_license(uc, tc.model_name, log)
+
+    # Determine which stages actually ran, not just which configs are present.
+    # config.training is always non-None (non-optional field with a default),
+    # so `config.training is not None` is always True -- use `enabled` instead.
+    _enabled = enabled or set()
     hf_cfg = HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
@@ -1040,9 +1063,9 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
         upload_merged=uc.upload_merged,
         base_model=uc.base_model or tc.model_name,
         dataset_name=tc.dataset_path,
-        did_training=config.training is not None,
-        did_heretic=config.heretic is not None,
-        did_magicquant=config.magicquant is not None,
+        did_training="training" in _enabled,
+        did_heretic="heretic" in _enabled,
+        did_magicquant="magicquant" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,
@@ -1058,10 +1081,14 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bo
     return upload(hf_cfg, config.output_dir, log=log)
 
 
-def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogFn):
+def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
+                         enabled: set = None):
     """Dry-run upload: validate credentials and report what would be uploaded.
 
     Returns a DryRunReport (from hf_upload module).
+
+    Args:
+        enabled: set of stage names that actually ran. See stage_upload().
     """
     from hf_upload import HFUploadConfig, dry_run
 
@@ -1072,6 +1099,7 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
 
     tc = config.training
     license_id = _resolve_license(uc, tc.model_name, log)
+    _enabled = enabled or set()
     hf_cfg = HFUploadConfig(
         repo_id=uc.repo_id,
         private=uc.private,
@@ -1081,9 +1109,9 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         upload_merged=uc.upload_merged,
         base_model=uc.base_model or tc.model_name,
         dataset_name=tc.dataset_path,
-        did_training=config.training is not None,
-        did_heretic=config.heretic is not None,
-        did_magicquant=config.magicquant is not None,
+        did_training="training" in _enabled,
+        did_heretic="heretic" in _enabled,
+        did_magicquant="magicquant" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
         lora_dropout=tc.lora_dropout,
@@ -1135,7 +1163,12 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
             results[stage_name] = None
             continue
 
-        ok = stage_fn(config, artifacts, log)
+        # Upload stages need to know which stages actually ran (not just
+        # which configs are present) to generate accurate model cards.
+        if stage_name == "upload":
+            ok = stage_fn(config, artifacts, log, enabled=enabled)
+        else:
+            ok = stage_fn(config, artifacts, log)
         results[stage_name] = ok
         if not ok:
             log(f"Pipeline stopped at {stage_name}", "error")
@@ -1209,7 +1242,19 @@ if __name__ == "__main__":
                 print("ERROR: --dry-run requires --upload-to <repo_id>")
                 sys.exit(1)
         artifacts = Artifacts(cfg.output_dir)
-        report = stage_upload_dry_run(cfg, artifacts, _default_log)
+        # Build the enabled set from config presence (same logic as run_pipeline).
+        _dry_enabled = set()
+        if cfg.training is not None:
+            _dry_enabled.add("training")
+        if cfg.export is not None:
+            _dry_enabled.add("export")
+        if cfg.heretic is not None:
+            _dry_enabled.add("heretic")
+        if cfg.magicquant is not None:
+            _dry_enabled.add("magicquant")
+        if cfg.upload is not None:
+            _dry_enabled.add("upload")
+        report = stage_upload_dry_run(cfg, artifacts, _default_log, enabled=_dry_enabled)
         sys.exit(0 if report and report.ok else 1)
 
     results = run_pipeline(cfg)

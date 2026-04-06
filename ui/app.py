@@ -373,7 +373,11 @@ async def do_training(cfg: RunRequest) -> bool:
     tc = cfg.training
     out = _resolve_out(tc.output_dir)
 
-    # Skip if LoRA adapters already exist
+    # Skip if LoRA adapters already exist.
+    # NOTE: This only checks for artifact existence, not that they match the
+    # current run config (same model, same dataset, same hyperparameters).
+    # A previous run's output for a different config would cause a false skip.
+    # A full fix would hash the config and store it alongside the artifacts.
     adapter_cfg = out / "lora_adapters" / "adapter_config.json"
     if adapter_cfg.exists():
         await state.log(f"LoRA adapters already exist at {out / 'lora_adapters'} — skipping training", "success")
@@ -423,7 +427,10 @@ async def do_export(cfg: RunRequest) -> bool:
     training_enabled = "training" in cfg.enabled_stages
     mq_enabled = "magicquant" in cfg.enabled_stages
 
-    # Skip if expected artifacts already exist
+    # Skip if expected artifacts already exist.
+    # NOTE: This only checks for artifact existence, not that they match the
+    # current run config. Artifacts from a different model/config would cause
+    # a false skip. A full fix would hash the config and compare.
     if mq_enabled:
         merged = out_abs / "merged_model"
         has_safetensors = merged.exists() and any(merged.glob("*.safetensors"))
@@ -502,7 +509,9 @@ async def do_heretic(cfg: RunRequest) -> bool:
     out_abs = _resolve_out(out)
     hc = cfg.heretic
 
-    # Skip if heretic output already exists
+    # Skip if heretic output already exists.
+    # NOTE: No config-match check -- stale artifacts from a different run
+    # would cause a false skip. See do_training() for the same limitation.
     heretic_dir = out_abs / "heretic_model"
     if heretic_dir.exists() and any(heretic_dir.glob("*.safetensors")):
         await state.log(f"Abliterated model already exists at {heretic_dir} -- skipping heretic", "success")
@@ -550,7 +559,9 @@ async def do_magicquant(cfg: RunRequest) -> bool:
     mc = cfg.magicquant
     export_enabled = "export" in cfg.enabled_stages
 
-    # Skip if MagicQuant GGUFs already exist
+    # Skip if MagicQuant GGUFs already exist.
+    # NOTE: No config-match check -- stale artifacts from a different run
+    # would cause a false skip. See do_training() for the same limitation.
     mq_dir = out_abs / "magicquant"
     if mq_dir.exists():
         existing_ggufs = list(mq_dir.glob("*.gguf"))
@@ -849,6 +860,9 @@ async def set_config(body: dict):
     return cfg
 
 
+_pipeline_lock = asyncio.Lock()
+
+
 @app.post("/api/run", dependencies=[Depends(verify_api_key)])
 async def start_pipeline(cfg: RunRequest):
     """
@@ -856,14 +870,18 @@ async def start_pipeline(cfg: RunRequest):
 
     Accepts a full RunRequest with per-stage config and an enabled_stages list.
     Returns an error if a pipeline is already in progress.
+    Uses an asyncio.Lock to prevent race conditions from rapid concurrent requests.
     """
-    if state.running:
+    if _pipeline_lock.locked():
         return {"error": "Pipeline is already running"}
-    state.running = True
-    for s in ALL_STAGES:
-        state.stages[s] = StageStatus.PENDING
-    state.progress = 0
-    asyncio.create_task(run_pipeline(cfg))
+    async with _pipeline_lock:
+        if state.running:
+            return {"error": "Pipeline is already running"}
+        state.running = True
+        for s in ALL_STAGES:
+            state.stages[s] = StageStatus.PENDING
+        state.progress = 0
+        asyncio.create_task(run_pipeline(cfg))
     return {"status": "started"}
 
 
