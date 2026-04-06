@@ -12,6 +12,7 @@ Port defaults to 7865 (configurable via FOUNDRY_UI_PORT env var).
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -858,6 +859,61 @@ async def set_config(body: dict):
     cfg.update(body)
     save_config(cfg)
     return cfg
+
+
+# ── Workflow save/restore ───────────────────────────────────────────────────
+
+WORKFLOW_DIR = Path.home() / ".foundry" / "workflows"
+_WORKFLOW_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+@app.get("/api/workflows", dependencies=[Depends(verify_api_key)])
+async def list_workflows():
+    """List saved workflow names."""
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(WORKFLOW_DIR.glob("*.json"))
+    return {"workflows": [f.stem for f in files]}
+
+
+@app.post("/api/workflows/{name}", dependencies=[Depends(verify_api_key)])
+async def save_workflow(name: str, cfg: RunRequest):
+    """Save current config as a named workflow."""
+    if not _WORKFLOW_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid workflow name. Use alphanumeric, hyphens, and underscores only.")
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "name": name,
+        "saved_at": time.time(),
+        "enabled_stages": cfg.enabled_stages,
+        "config": cfg.model_dump(),
+    }
+    path = WORKFLOW_DIR / f"{name}.json"
+    path.write_text(json.dumps(data, indent=2))
+    return {"status": "saved", "name": name}
+
+
+@app.get("/api/workflows/{name}", dependencies=[Depends(verify_api_key)])
+async def load_workflow(name: str):
+    """Load a saved workflow."""
+    if not _WORKFLOW_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid workflow name.")
+    path = WORKFLOW_DIR / f"{name}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Workflow '{name}' not found")
+    data = json.loads(path.read_text())
+    return data
+
+
+@app.delete("/api/workflows/{name}", dependencies=[Depends(verify_api_key)])
+async def delete_workflow(name: str):
+    """Delete a saved workflow."""
+    if not _WORKFLOW_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid workflow name.")
+    path = WORKFLOW_DIR / f"{name}.json"
+    if path.exists():
+        path.unlink()
+    return {"status": "deleted", "name": name}
 
 
 _pipeline_lock = asyncio.Lock()

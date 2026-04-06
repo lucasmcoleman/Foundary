@@ -163,6 +163,20 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 .settings-saved { font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.2s; }
 .settings-saved.show { opacity: 1; }
 
+.workflow-bar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 16px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px; }
+.workflow-bar .wf-label { font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--text-3); white-space: nowrap; }
+.workflow-bar select { font-family: var(--font-mono); font-size: 12px; padding: 4px 8px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 4px; color: var(--text-0); outline: none; min-width: 140px; max-width: 220px; }
+.workflow-bar select:focus { border-color: var(--amber-dim); }
+.workflow-bar .wf-btn { font-family: var(--font-mono); font-size: 11px; font-weight: 500; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-3); color: var(--text-1); cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+.workflow-bar .wf-btn:hover { background: var(--bg-4); border-color: var(--border-bright); color: var(--text-0); }
+.workflow-bar .wf-btn-save { border-color: var(--amber-dim); color: var(--amber); }
+.workflow-bar .wf-btn-save:hover { background: var(--amber-glow); }
+.workflow-bar .wf-btn-del { color: var(--text-3); padding: 4px 6px; }
+.workflow-bar .wf-btn-del:hover { color: var(--red); border-color: var(--red-dim); }
+.workflow-bar .wf-spacer { flex: 1; }
+.workflow-bar .wf-status { font-size: 11px; color: var(--green); opacity: 0; transition: opacity 0.3s; }
+.workflow-bar .wf-status.show { opacity: 1; }
+
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -280,6 +294,11 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
 
   /* Dependency banner */
   .dep-banner { font-size: 11px; padding: 10px 12px; }
+
+  /* Workflow bar */
+  .workflow-bar { flex-wrap: wrap; gap: 8px; padding: 8px; }
+  .workflow-bar select { min-width: 100px; flex: 1; }
+  .workflow-bar .wf-spacer { display: none; }
 }
 
 /* ── Small mobile (<400px) ── */
@@ -366,6 +385,15 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
   </aside>
 
   <main class="main" id="main-content">
+    <div class="workflow-bar" id="workflow-bar">
+      <span class="wf-label">Workflow</span>
+      <select id="wf-select"><option value="">-- none --</option></select>
+      <button class="wf-btn" onclick="loadSelectedWorkflow()" title="Load selected workflow">Load</button>
+      <button class="wf-btn wf-btn-del" onclick="deleteSelectedWorkflow()" title="Delete selected workflow">&#x2715;</button>
+      <div class="wf-spacer"></div>
+      <span class="wf-status" id="wf-status"></span>
+      <button class="wf-btn wf-btn-save" onclick="saveCurrentWorkflow()" title="Save current config as a workflow">Save As...</button>
+    </div>
     <div class="status-banner" id="status-banner">
       <span id="status-banner-text"></span>
       <span class="dismiss" onclick="dismissStatus()">&times;</span>
@@ -495,7 +523,7 @@ const S = {
 const LS_KEY = 'foundry_form_state';
 // Bump this when defaults change. Mismatched versions discard saved state
 // so users pick up corrected defaults instead of perpetuating stale values.
-const LS_VERSION = 4;
+const LS_VERSION = 5;
 
 /**
  * Save the current form config and enabled stages to localStorage.
@@ -587,6 +615,140 @@ async function saveConfig() {
 
 /** Debounce wrapper for saveConfig -- waits 600ms after last keystroke. */
 function saveConfigDebounced() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveConfig, 600); }
+
+// ── Workflow Save/Restore ─────────────────────────────────────────────────
+
+/** Show a brief status message in the workflow bar. */
+function wfFlash(msg) {
+  const el = document.getElementById('wf-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+/** Refresh the workflow dropdown from the server. */
+async function refreshWorkflowList() {
+  try {
+    const r = await authFetch('/api/workflows');
+    const d = await r.json();
+    const sel = document.getElementById('wf-select');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">-- none --</option>';
+    for (const name of (d.workflows || [])) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    // Restore previous selection if it still exists
+    if (prev && d.workflows && d.workflows.includes(prev)) {
+      sel.value = prev;
+    }
+  } catch(e) { /* silent */ }
+}
+
+/** Save the current pipeline config as a named workflow. */
+async function saveCurrentWorkflow() {
+  const name = prompt('Save workflow as (alphanumeric, hyphens, underscores):');
+  if (!name) return;
+  const clean = name.trim();
+  if (!/^[a-zA-Z0-9_-]+$/.test(clean)) {
+    showStatus('Invalid name. Use letters, numbers, hyphens, underscores only.', 'error');
+    return;
+  }
+  const stageOrder = ['training', 'export', 'heretic', 'magicquant', 'upload'];
+  const enabled = stageOrder.filter(s => S.enabledStages.has(s));
+  const payload = {
+    training: S.config.training,
+    export: S.config.export,
+    heretic: S.config.heretic,
+    magicquant: S.config.magicquant,
+    upload: S.config.upload,
+    enabled_stages: enabled,
+  };
+  try {
+    const r = await authFetch(`/api/workflows/${encodeURIComponent(clean)}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) { const e = await r.json(); showStatus(e.detail || 'Save failed', 'error'); return; }
+    wfFlash('Saved');
+    await refreshWorkflowList();
+    document.getElementById('wf-select').value = clean;
+  } catch(e) {
+    showStatus(`Save failed: ${e.message}`, 'error');
+  }
+}
+
+/**
+ * Load a workflow from the server and apply it to the current config.
+ * Forward-compatible: unknown saved stages are ignored, new stages keep defaults.
+ */
+async function loadSelectedWorkflow() {
+  const sel = document.getElementById('wf-select');
+  const name = sel ? sel.value : '';
+  if (!name) { showStatus('Select a workflow first.', 'warn'); return; }
+  try {
+    const r = await authFetch(`/api/workflows/${encodeURIComponent(name)}`);
+    if (!r.ok) { const e = await r.json(); showStatus(e.detail || 'Load failed', 'error'); return; }
+    const data = await r.json();
+    applyWorkflow(data);
+    wfFlash('Loaded');
+  } catch(e) {
+    showStatus(`Load failed: ${e.message}`, 'error');
+  }
+}
+
+/**
+ * Apply a loaded workflow to the current application state.
+ * Deep-merges saved config into current defaults for forward compatibility.
+ */
+function applyWorkflow(data) {
+  const saved = data.config || {};
+  // For each stage section, merge saved values into current defaults
+  for (const section of Object.keys(S.config)) {
+    if (saved[section]) {
+      // Only apply keys that exist in the current config schema
+      for (const key of Object.keys(saved[section])) {
+        if (key in S.config[section]) {
+          S.config[section][key] = saved[section][key];
+        }
+      }
+    }
+    // If a stage exists in current config but not in saved, keep defaults (forward compat)
+  }
+  // Restore enabled stages (ignore unknown stages from old saves)
+  if (data.enabled_stages) {
+    const validStages = new Set(['training', 'export', 'heretic', 'magicquant', 'upload']);
+    S.enabledStages = new Set(data.enabled_stages.filter(s => validStages.has(s)));
+  }
+  // Sync sidebar toggles
+  document.querySelectorAll('.stage-item .stage-toggle input').forEach(input => {
+    const stage = input.closest('.stage-item')?.dataset.stage;
+    if (stage) input.checked = S.enabledStages.has(stage);
+  });
+  renderStageContent();
+  saveFormState();
+}
+
+/** Delete the selected workflow from the server. */
+async function deleteSelectedWorkflow() {
+  const sel = document.getElementById('wf-select');
+  const name = sel ? sel.value : '';
+  if (!name) { showStatus('Select a workflow first.', 'warn'); return; }
+  if (!confirm(`Delete workflow "${name}"?`)) return;
+  try {
+    const r = await authFetch(`/api/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    if (!r.ok) { const e = await r.json(); showStatus(e.detail || 'Delete failed', 'error'); return; }
+    wfFlash('Deleted');
+    await refreshWorkflowList();
+  } catch(e) {
+    showStatus(`Delete failed: ${e.message}`, 'error');
+  }
+}
 
 /** Toggle the settings popover open/closed. */
 function toggleSettings() {
@@ -1153,6 +1315,7 @@ async function initAuth() {
   restoreFormState();
   await initAuth();
   loadConfig();
+  refreshWorkflowList();
   connectWS();
   renderStageContent();
 })();
