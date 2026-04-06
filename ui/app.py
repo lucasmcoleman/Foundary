@@ -925,6 +925,17 @@ async def list_runs():
     if not output_dir.exists():
         return {"runs": []}
 
+    # Detect which output dir the active pipeline is writing to
+    active_dir = None
+    if state.running and state.active_proc and state.active_proc.returncode is None:
+        # Find the most recently modified _stage_*.log across all output dirs
+        try:
+            all_logs = sorted(output_dir.rglob("_stage_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if all_logs:
+                active_dir = all_logs[0].parent.name
+        except Exception:
+            pass
+
     runs = []
     for model_dir in sorted(output_dir.iterdir(), reverse=True):
         if not model_dir.is_dir():
@@ -935,6 +946,7 @@ async def list_runs():
                 "name": log_file.name,
                 "size": log_file.stat().st_size,
                 "modified": log_file.stat().st_mtime,
+                "live": state.running and model_dir.name == active_dir and log_file == sorted(model_dir.glob("_stage_*.log"), key=lambda p: p.stat().st_mtime)[-1],
             })
         # Also check for magicquant subdir logs
         mq_dir = model_dir / "magicquant"
@@ -954,8 +966,9 @@ async def list_runs():
             "ggufs": ggufs,
             "has_lora": has_lora,
             "has_merged": has_merged,
+            "active": model_dir.name == active_dir,
         })
-    return {"runs": runs}
+    return {"runs": runs, "pipeline_running": state.running}
 
 
 @app.get("/api/runs/{model}/{logfile}", dependencies=[Depends(verify_api_key)])

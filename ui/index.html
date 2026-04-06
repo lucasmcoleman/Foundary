@@ -1371,6 +1371,8 @@ async function openHistory() {
 
 /** Close the history overlay. */
 function closeHistory() {
+  clearTimeout(window._logRefreshTimer);
+  clearTimeout(window._historyRefreshTimer);
   document.getElementById('history-overlay').classList.remove('open');
 }
 
@@ -1385,8 +1387,15 @@ async function loadRunHistory() {
       listEl.innerHTML = '<div class="history-empty">No pipeline runs found.<br>Run a pipeline to see history here.</div>';
       return;
     }
+    // Auto-refresh when pipeline is running
+    if (data.pipeline_running) {
+      clearTimeout(window._historyRefreshTimer);
+      window._historyRefreshTimer = setTimeout(loadRunHistory, 5000);
+    }
+
     listEl.innerHTML = runs.map((run, i) => {
       const artifacts = [];
+      if (run.active) artifacts.push('<span class="history-artifact yes" style="background:rgba(251,191,36,0.15);color:var(--amber);border-color:var(--amber-dim);animation:pulse 2s infinite">\u25cf LIVE</span>');
       artifacts.push(`<span class="history-artifact ${run.has_lora ? 'yes' : 'no'}">LoRA ${run.has_lora ? '\u2713' : '\u2717'}</span>`);
       artifacts.push(`<span class="history-artifact ${run.has_merged ? 'yes' : 'no'}">Merged ${run.has_merged ? '\u2713' : '\u2717'}</span>`);
 
@@ -1395,13 +1404,14 @@ async function loadRunHistory() {
       const logs = (run.logs || []).map(log => {
         const ts = new Date(log.modified * 1000).toLocaleString();
         const sizeKb = (log.size / 1024).toFixed(0);
-        return `<div class="history-log-entry" onclick="event.stopPropagation();loadRunLog('${run.model}','${log.name}',this)" title="${ts}">
-          <span class="log-ts">${log.name.replace('_stage_','').replace('.log','')}</span>
+        const liveBadge = log.live ? ' <span style="color:var(--amber);font-size:9px">\u25cf LIVE</span>' : '';
+        return `<div class="history-log-entry" onclick="event.stopPropagation();loadRunLog('${run.model}','${log.name}',this,${!!log.live})" title="${ts}">
+          <span class="log-ts">${log.name.replace('_stage_','').replace('.log','')}${liveBadge}</span>
           <span class="log-size">${sizeKb} KB</span>
         </div>`;
       }).join('');
 
-      return `<div class="history-run-item" data-run="${i}" onclick="toggleRunExpand(this)">
+      return `<div class="history-run-item ${run.active ? 'active' : ''}" data-run="${i}" onclick="toggleRunExpand(this)">
         <div class="history-run-model">${escapeHtml(run.model)}</div>
         <div class="history-run-meta">${artifacts}</div>
         ${ggufs ? '<div class="history-gguf-list">' + ggufs + '</div>' : ''}
@@ -1427,7 +1437,8 @@ function toggleRunExpand(el) {
 }
 
 /** Fetch and display a specific log file in the viewer panel. */
-async function loadRunLog(model, logfile, entryEl) {
+async function loadRunLog(model, logfile, entryEl, live = false) {
+  clearTimeout(window._logRefreshTimer);
   // Mark active
   document.querySelectorAll('.history-log-entry.active').forEach(e => e.classList.remove('active'));
   if (entryEl) entryEl.classList.add('active');
@@ -1450,7 +1461,8 @@ async function loadRunLog(model, logfile, entryEl) {
       return;
     }
     const data = await r.json();
-    meta.innerHTML = `${data.total_lines} lines` + (data.truncated ? ' <span class="hlv-badge truncated">Truncated to last 2000 lines</span>' : '');
+    const liveLabel = live ? ' <span style="color:var(--amber)">\u25cf Live — auto-refreshing</span>' : '';
+    meta.innerHTML = `${data.total_lines} lines${liveLabel}` + (data.truncated ? ' <span class="hlv-badge truncated">Truncated to last 2000 lines</span>' : '');
 
     // Render content as preformatted text
     const pre = document.createElement('div');
@@ -1458,6 +1470,11 @@ async function loadRunLog(model, logfile, entryEl) {
     pre.textContent = data.content;
     content.innerHTML = '';
     content.appendChild(pre);
+    // Auto-scroll to bottom for live logs
+    if (live) {
+      content.scrollTop = content.scrollHeight;
+      window._logRefreshTimer = setTimeout(() => loadRunLog(model, logfile, entryEl, true), 3000);
+    }
   } catch (e) {
     content.innerHTML = `<div class="history-log-placeholder" style="color:var(--red)">Error: ${escapeHtml(e.message)}</div>`;
   }
