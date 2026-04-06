@@ -916,6 +916,71 @@ async def delete_workflow(name: str):
     return {"status": "deleted", "name": name}
 
 
+# ── Run History ──────────────────────────────────────────────────────────────
+
+@app.get("/api/runs", dependencies=[Depends(verify_api_key)])
+async def list_runs():
+    """List all pipeline output directories with their stage logs."""
+    output_dir = FOUNDRY_DIR / "output"
+    if not output_dir.exists():
+        return {"runs": []}
+
+    runs = []
+    for model_dir in sorted(output_dir.iterdir(), reverse=True):
+        if not model_dir.is_dir():
+            continue
+        logs = []
+        for log_file in sorted(model_dir.glob("_stage_*.log"), reverse=True):
+            logs.append({
+                "name": log_file.name,
+                "size": log_file.stat().st_size,
+                "modified": log_file.stat().st_mtime,
+            })
+        # Also check for magicquant subdir logs
+        mq_dir = model_dir / "magicquant"
+        ggufs = []
+        if mq_dir.exists():
+            for gguf in mq_dir.glob("*.gguf"):
+                ggufs.append({"name": gguf.name, "size_gb": round(gguf.stat().st_size / 1e9, 1)})
+
+        # Check what artifacts exist
+        has_lora = (model_dir / "lora_adapters" / "adapter_config.json").exists()
+        has_merged = (model_dir / "merged_model").exists() and any((model_dir / "merged_model").glob("*.safetensors"))
+
+        runs.append({
+            "model": model_dir.name,
+            "path": str(model_dir),
+            "logs": logs,
+            "ggufs": ggufs,
+            "has_lora": has_lora,
+            "has_merged": has_merged,
+        })
+    return {"runs": runs}
+
+
+@app.get("/api/runs/{model}/{logfile}", dependencies=[Depends(verify_api_key)])
+async def get_run_log(model: str, logfile: str):
+    """Read a specific log file from a run."""
+    # Validate names to prevent path traversal
+    if not re.match(r'^[\w\-.]+$', model) or not re.match(r'^_stage_\d+\.log$', logfile):
+        raise HTTPException(status_code=400, detail="Invalid name")
+
+    path = FOUNDRY_DIR / "output" / model / logfile
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Log not found")
+
+    # Return last 2000 lines if file is huge, or full content if reasonable
+    content = path.read_text(errors="replace")
+    lines = content.split("\n")
+    return {
+        "model": model,
+        "logfile": logfile,
+        "total_lines": len(lines),
+        "content": content if len(content) < 500_000 else "\n".join(lines[-2000:]),
+        "truncated": len(content) >= 500_000,
+    }
+
+
 _pipeline_lock = asyncio.Lock()
 
 

@@ -310,6 +310,47 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
   .stage-item { padding: 6px 10px; }
   .stage-item .stage-name { font-size: 11px; }
 }
+
+/* ── Run History Overlay ── */
+.history-overlay { display: none; position: fixed; inset: 0; z-index: 500; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); }
+.history-overlay.open { display: flex; align-items: center; justify-content: center; animation: tip-in 0.15s ease; }
+.history-panel { width: 90vw; max-width: 1100px; height: 80vh; background: var(--bg-1); border: 1px solid var(--border-bright); border-radius: 8px; display: grid; grid-template-rows: auto 1fr; overflow: hidden; box-shadow: 0 16px 48px rgba(0,0,0,0.6); }
+.history-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+.history-header-title { font-family: var(--font-sans); font-size: 16px; font-weight: 700; }
+.history-close { font-size: 20px; cursor: pointer; color: var(--text-2); background: none; border: none; padding: 4px 8px; border-radius: 4px; }
+.history-close:hover { color: var(--text-0); background: var(--bg-3); }
+.history-body { display: grid; grid-template-columns: 320px 1fr; overflow: hidden; }
+.history-run-list { overflow-y: auto; border-right: 1px solid var(--border); padding: 12px 0; }
+.history-run-item { padding: 12px 16px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.12s; }
+.history-run-item:hover { background: var(--bg-2); }
+.history-run-item.active { background: var(--bg-2); border-left-color: var(--amber); }
+.history-run-model { font-weight: 600; font-size: 13px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-run-meta { font-size: 11px; color: var(--text-2); display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.history-artifact { font-size: 10px; padding: 2px 6px; border-radius: 3px; }
+.history-artifact.yes { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid var(--green-dim); }
+.history-artifact.no { background: var(--bg-3); color: var(--text-3); border: 1px solid var(--border); }
+.history-log-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.history-log-entry { font-size: 11px; padding: 4px 8px; border-radius: 3px; background: var(--bg-3); border: 1px solid var(--border); cursor: pointer; transition: all 0.12s; display: flex; justify-content: space-between; align-items: center; }
+.history-log-entry:hover { border-color: var(--amber-dim); background: var(--amber-glow); }
+.history-log-entry.active { border-color: var(--amber); background: var(--amber-glow); }
+.history-log-entry .log-ts { color: var(--text-2); }
+.history-log-entry .log-size { color: var(--text-3); font-size: 10px; }
+.history-log-viewer { display: flex; flex-direction: column; overflow: hidden; }
+.history-log-viewer-header { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-2); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.history-log-viewer-header .hlv-title { font-weight: 600; color: var(--text-0); }
+.history-log-viewer-header .hlv-badge { font-size: 10px; padding: 2px 8px; border-radius: 3px; }
+.hlv-badge.truncated { background: rgba(245,158,11,0.1); color: var(--amber); border: 1px solid var(--amber-dim); }
+.history-log-content { flex: 1; overflow-y: auto; padding: 12px 16px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; color: var(--text-1); }
+.history-log-placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-3); font-size: 13px; }
+.history-empty { padding: 40px; text-align: center; color: var(--text-3); font-size: 13px; }
+.history-gguf-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.history-gguf { font-size: 10px; padding: 2px 6px; border-radius: 3px; background: rgba(168,85,247,0.1); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }
+
+@media (max-width: 768px) {
+  .history-panel { width: 95vw; height: 90vh; }
+  .history-body { grid-template-columns: 1fr; grid-template-rows: 200px 1fr; }
+  .history-run-list { border-right: none; border-bottom: 1px solid var(--border); }
+}
 </style>
 </head>
 <body>
@@ -321,6 +362,7 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
     </div>
     <div class="header-right">
       <div class="gpu-badge"><div class="dot"></div><span id="gpu-name">Radeon 8060S &middot; 112GB GTT</span></div>
+      <button class="btn" onclick="openHistory()" title="View logs from past pipeline runs">&#128337; History</button>
       <div class="settings-wrap">
         <button class="settings-btn" onclick="toggleSettings()"><span class="gear">&#9881;</span> Settings</button>
         <div class="settings-pop" id="settings-pop">
@@ -410,6 +452,29 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
       </div>
     </div>
     <div class="logs-body" id="logs-body"></div>
+  </div>
+</div>
+
+<div class="history-overlay" id="history-overlay" onclick="if(event.target===this)closeHistory()">
+  <div class="history-panel">
+    <div class="history-header">
+      <div class="history-header-title">Run History</div>
+      <button class="history-close" onclick="closeHistory()">&times;</button>
+    </div>
+    <div class="history-body">
+      <div class="history-run-list" id="history-run-list">
+        <div class="history-empty">Loading...</div>
+      </div>
+      <div class="history-log-viewer">
+        <div class="history-log-viewer-header" id="history-log-header" style="display:none">
+          <span class="hlv-title" id="hlv-title"></span>
+          <span id="hlv-meta"></span>
+        </div>
+        <div class="history-log-content" id="history-log-content">
+          <div class="history-log-placeholder">Select a log file to view its contents</div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1291,6 +1356,110 @@ async function stopPipeline() {
     else appendLog('Stop requested...', 'warn');
   } catch (e) {
     appendLog(`Stop request failed: ${e.message}`, 'error');
+  }
+}
+
+// ── Run History ───────────────────────────────────────────────────────────
+
+/** Open the history overlay and fetch run data. */
+async function openHistory() {
+  document.getElementById('history-overlay').classList.add('open');
+  document.getElementById('history-log-content').innerHTML = '<div class="history-log-placeholder">Select a log file to view its contents</div>';
+  document.getElementById('history-log-header').style.display = 'none';
+  await loadRunHistory();
+}
+
+/** Close the history overlay. */
+function closeHistory() {
+  document.getElementById('history-overlay').classList.remove('open');
+}
+
+/** Fetch and render the list of past runs. */
+async function loadRunHistory() {
+  const listEl = document.getElementById('history-run-list');
+  try {
+    const r = await authFetch('/api/runs');
+    const data = await r.json();
+    const runs = data.runs || [];
+    if (runs.length === 0) {
+      listEl.innerHTML = '<div class="history-empty">No pipeline runs found.<br>Run a pipeline to see history here.</div>';
+      return;
+    }
+    listEl.innerHTML = runs.map((run, i) => {
+      const artifacts = [];
+      artifacts.push(`<span class="history-artifact ${run.has_lora ? 'yes' : 'no'}">LoRA ${run.has_lora ? '\u2713' : '\u2717'}</span>`);
+      artifacts.push(`<span class="history-artifact ${run.has_merged ? 'yes' : 'no'}">Merged ${run.has_merged ? '\u2713' : '\u2717'}</span>`);
+
+      const ggufs = (run.ggufs || []).map(g => `<span class="history-gguf">${g.name} (${g.size_gb}GB)</span>`).join('');
+
+      const logs = (run.logs || []).map(log => {
+        const ts = new Date(log.modified * 1000).toLocaleString();
+        const sizeKb = (log.size / 1024).toFixed(0);
+        return `<div class="history-log-entry" onclick="event.stopPropagation();loadRunLog('${run.model}','${log.name}',this)" title="${ts}">
+          <span class="log-ts">${log.name.replace('_stage_','').replace('.log','')}</span>
+          <span class="log-size">${sizeKb} KB</span>
+        </div>`;
+      }).join('');
+
+      return `<div class="history-run-item" data-run="${i}" onclick="toggleRunExpand(this)">
+        <div class="history-run-model">${escapeHtml(run.model)}</div>
+        <div class="history-run-meta">${artifacts}</div>
+        ${ggufs ? '<div class="history-gguf-list">' + ggufs + '</div>' : ''}
+        <div class="history-log-list">${logs || '<span style="font-size:11px;color:var(--text-3)">No stage logs</span>'}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    listEl.innerHTML = `<div class="history-empty">Failed to load runs: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/** Escape HTML entities for safe insertion. */
+function escapeHtml(text) {
+  const el = document.createElement('span');
+  el.textContent = text;
+  return el.innerHTML;
+}
+
+/** Toggle visual focus on a run item. */
+function toggleRunExpand(el) {
+  document.querySelectorAll('.history-run-item.active').forEach(e => { if (e !== el) e.classList.remove('active'); });
+  el.classList.toggle('active');
+}
+
+/** Fetch and display a specific log file in the viewer panel. */
+async function loadRunLog(model, logfile, entryEl) {
+  // Mark active
+  document.querySelectorAll('.history-log-entry.active').forEach(e => e.classList.remove('active'));
+  if (entryEl) entryEl.classList.add('active');
+
+  const content = document.getElementById('history-log-content');
+  const header = document.getElementById('history-log-header');
+  const title = document.getElementById('hlv-title');
+  const meta = document.getElementById('hlv-meta');
+
+  content.innerHTML = '<div class="history-log-placeholder">Loading...</div>';
+  header.style.display = 'flex';
+  title.textContent = `${model} / ${logfile}`;
+  meta.innerHTML = '';
+
+  try {
+    const r = await authFetch(`/api/runs/${encodeURIComponent(model)}/${encodeURIComponent(logfile)}`);
+    if (!r.ok) {
+      const e = await r.json();
+      content.innerHTML = `<div class="history-log-placeholder" style="color:var(--red)">${escapeHtml(e.detail || 'Failed to load')}</div>`;
+      return;
+    }
+    const data = await r.json();
+    meta.innerHTML = `${data.total_lines} lines` + (data.truncated ? ' <span class="hlv-badge truncated">Truncated to last 2000 lines</span>' : '');
+
+    // Render content as preformatted text
+    const pre = document.createElement('div');
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;';
+    pre.textContent = data.content;
+    content.innerHTML = '';
+    content.appendChild(pre);
+  } catch (e) {
+    content.innerHTML = `<div class="history-log-placeholder" style="color:var(--red)">Error: ${escapeHtml(e.message)}</div>`;
   }
 }
 
