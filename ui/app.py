@@ -939,7 +939,7 @@ async def list_runs():
             pass
 
     runs = []
-    for model_dir in sorted(output_dir.iterdir(), reverse=True):
+    for model_dir in sorted(output_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
         if not model_dir.is_dir():
             continue
         logs = []
