@@ -131,11 +131,10 @@ def fast_load_quantized_model(model_id: str = "Tesslate/OmniCoder-9B"):
     # meta tensor (no storage). We materialize real tensors shard-by-shard below.
     print("Creating model skeleton on meta device...")
     from transformers import AutoModelForCausalLM
-    # Use flash attention for efficient packing (prevents cross-contamination
-    # between packed examples). On ROCm this routes through torch SDPA.
-    config._attn_implementation = "flash_attention_2"
+    # Use SDPA (torch's built-in scaled dot product attention) which supports
+    # efficient attention on ROCm without needing flash-attn package.
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, attn_implementation="flash_attention_2")
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, attn_implementation="sdpa")
 
     model.eval()
 
