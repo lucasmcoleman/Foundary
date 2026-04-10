@@ -54,6 +54,7 @@ class HFUploadConfig:
     # Pipeline stages that were actually run (for conditional card sections)
     did_training: bool = True
     did_heretic: bool = False
+    did_reap: bool = False
     did_magicquant: bool = True
 
     # Training details (for the model card)
@@ -168,6 +169,8 @@ def generate_model_card(
             parts.append(f"fine-tuned on {dataset_name} with QLoRA")
         if cfg.did_heretic:
             parts.append("abliterated with [Heretic](https://github.com/p-e-w/heretic) for uncensored responses")
+        if cfg.did_reap:
+            parts.append("pruned with [REAP](https://github.com/CerebrasResearch/reap) (Router-weighted Expert Activation Pruning)")
         if cfg.did_magicquant:
             parts.append("quantized using MagicQuant hybrid evolutionary per-tensor search")
         elif has_gguf:
@@ -195,6 +198,8 @@ def generate_model_card(
         tags.extend(["fine-tuned", "qlora"])
     if cfg.did_heretic:
         tags.extend(["abliterated", "uncensored", "heretic"])
+    if cfg.did_reap:
+        tags.extend(["pruned", "reap", "moe"])
     if not tags:
         tags = ["gguf"]
     tags_yaml = "\n".join(f"  - {t}" for t in tags)
@@ -274,6 +279,21 @@ Safety alignment has been removed using **[Heretic](https://github.com/p-e-w/her
 - The result is a model that responds to all prompts without refusal behavior
 
 **This model will comply with any request.** Use responsibly.""")
+
+    # REAP section (only if expert pruning was applied)
+    if cfg.did_reap:
+        body_sections.append("""## Expert Pruning (REAP)
+
+This is a Mixture-of-Experts model pruned using **[REAP](https://github.com/CerebrasResearch/reap)**
+(Router-weighted Expert Activation Pruning) from Cerebras Research:
+
+- A calibration pass records router decisions and expert activations on representative data
+- Each expert is scored with a saliency metric weighted by router usage
+- The lowest-ranked experts in each MoE layer are dropped
+- The router is trimmed accordingly so the remaining experts cover the full routing distribution
+
+The result is a smaller MoE model with fewer experts per layer, trading a small amount of quality
+for reduced parameter count and inference cost.""")
 
     # MagicQuant section (only if quantized with MagicQuant)
     if cfg.did_magicquant:
@@ -364,6 +384,9 @@ print(output["choices"][0]["message"]["content"])
     if cfg.did_heretic:
         caveats.append("- **Safety alignment has been removed** -- this model may produce harmful, offensive, or dangerous content")
         caveats.append("- The abliteration process may slightly degrade model quality on some benchmarks")
+    if cfg.did_reap:
+        caveats.append("- Expert pruning removes a fraction of experts per MoE layer; some task-specific knowledge may be lost")
+        caveats.append("- The pruned model has a different number of experts from the original — tooling that hardcodes expert count may need adjustment")
     if cfg.did_magicquant or has_gguf:
         caveats.append("- Quantization reduces precision -- verify outputs for your specific use case")
     if cfg.did_magicquant:
@@ -375,6 +398,8 @@ print(output["choices"][0]["message"]["content"])
     if cfg.did_training:
         limitations.append(f"- Training data used sequences up to {cfg.max_seq_length} tokens; the model retains the base model's full context window")
         limitations.append("- Performance on tasks not represented in the training data may be degraded")
+    if cfg.did_reap:
+        limitations.append("- Pruned experts cannot be recovered; any capabilities concentrated in removed experts are lost")
     if cfg.did_magicquant or has_gguf:
         limitations.append("- Quantized models may exhibit subtle differences from the full-precision fine-tune")
     limitations.append("- This model inherits any limitations and biases present in the base model")
@@ -386,6 +411,8 @@ print(output["choices"][0]["message"]["content"])
         pipeline_parts.append("[Foundry](https://github.com/lucasmcoleman/Foundry)")
     if cfg.did_heretic:
         pipeline_parts.append("[Heretic](https://github.com/p-e-w/heretic)")
+    if cfg.did_reap:
+        pipeline_parts.append("[REAP](https://github.com/CerebrasResearch/reap)")
     if cfg.did_magicquant:
         pipeline_parts.append("[MagicQuant](https://github.com/lucasmcoleman/MagicQuant)")
     body_sections.append("---\n*Generated with " + " + ".join(pipeline_parts or ["Foundry"]) + "*")

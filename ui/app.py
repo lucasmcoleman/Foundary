@@ -30,6 +30,7 @@ from services import (
     TrainingService,
     ExportService,
     HereticService,
+    ReapService,
     MagicQuantService,
     UploadService,
 )
@@ -68,7 +69,7 @@ class StageStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
-ALL_STAGES = ["training", "export", "heretic", "magicquant", "upload"]
+ALL_STAGES = ["training", "export", "heretic", "reap", "magicquant", "upload"]
 
 class PipelineState:
     """Shared mutable state for the running pipeline, including WebSocket fan-out."""
@@ -141,6 +142,14 @@ class HereticCfg(BaseModel):
     orthogonalize_direction: bool = False
     row_normalization: str = "none"
 
+class ReapCfg(BaseModel):
+    compression_ratio: float = 0.25
+    prune_method: str = "reap"
+    samples_per_category: int = 512
+    model_max_length: int = 2048
+    dataset_name: str = "theblackcat102/evol-codealpaca-v1"
+    seed: int = 42
+
 class MagicQuantCfg(BaseModel):
     target_base_quant: str = "MXFP4_MOE"
     generations: int = 50
@@ -162,6 +171,7 @@ class RunRequest(BaseModel):
     training: TrainingCfg = TrainingCfg()
     export: Optional[ExportCfg] = ExportCfg()
     heretic: Optional[HereticCfg] = None
+    reap: Optional[ReapCfg] = None
     magicquant: Optional[MagicQuantCfg] = None
     upload: Optional[UploadCfg] = None
     enabled_stages: list[str] = ["training", "export"]
@@ -555,6 +565,111 @@ async def do_heretic(cfg: RunRequest) -> bool:
     return ok
 
 
+REAP_SUPPORTED_ARCHS = {
+    "Qwen3MoeForCausalLM",
+    "Qwen3-Coder-30B-A3B-Instruct",
+    "NonUniformQwen3MoeForCausalLM",
+    "Llama4ForCausalLM",
+    "MixtralForCausalLM",
+    "DeepseekV2ForCausalLM",
+    "Ernie4_5_MoEForCausalLM",
+    "Ernie4_5_MoeForCausalLM",
+    "gpt-oss-20b",
+    "Glm4MoeForCausalLM",
+}
+
+
+def _detect_model_arch(model_path: Path) -> Optional[str]:
+    """Read config.json and return the first entry in architectures list, or None."""
+    cfg_path = model_path / "config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        data = json.loads(cfg_path.read_text())
+        archs = data.get("architectures") or []
+        if archs and isinstance(archs, list):
+            return archs[0]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+async def do_reap(cfg: RunRequest) -> bool:
+    """Run REAP expert pruning on the merged or abliterated model.
+
+    Reads from heretic_model/ (preferred) or merged_model/ and writes to
+    reap_model/. Silently skips (returns True) if the architecture is not
+    supported by REAP.
+    """
+    out = cfg.training.output_dir
+    out_abs = _resolve_out(out)
+    rc = cfg.reap
+
+    # Skip if REAP output already exists.
+    reap_dir = out_abs / "reap_model"
+    if reap_dir.exists() and any(reap_dir.glob("*.safetensors")):
+        await state.log(f"Pruned model already exists at {reap_dir} — skipping REAP", "success")
+        await state.set_stage("reap", StageStatus.COMPLETE)
+        await state.set_progress(100)
+        return True
+
+    # Determine model source: prefer heretic output, fall back to merged_model
+    heretic_dir = out_abs / "heretic_model"
+    merged_dir = out_abs / "merged_model"
+    if heretic_dir.exists() and any(heretic_dir.glob("*.safetensors")):
+        source_dir = heretic_dir
+        await state.log(f"REAP source: abliterated model at {source_dir}")
+    elif merged_dir.exists() and any(merged_dir.glob("*.safetensors")):
+        source_dir = merged_dir
+        await state.log(f"REAP source: merged model at {source_dir}")
+    else:
+        await state.log("No merged or abliterated model found -- run export first", "error")
+        await state.set_stage("reap", StageStatus.FAILED)
+        return False
+
+    # Check architecture support before launching a subprocess.
+    arch = _detect_model_arch(source_dir)
+    if arch is None:
+        await state.log(
+            f"Could not detect model architecture from {source_dir}/config.json — skipping REAP",
+            "warn",
+        )
+        await state.set_stage("reap", StageStatus.SKIPPED)
+        return True
+    if arch not in REAP_SUPPORTED_ARCHS:
+        await state.log(
+            f"Architecture '{arch}' is not supported by REAP — skipping stage",
+            "warn",
+        )
+        await state.log(f"  REAP supports: {sorted(REAP_SUPPORTED_ARCHS)}")
+        await state.set_stage("reap", StageStatus.SKIPPED)
+        return True
+    await state.log(f"Detected supported REAP architecture: {arch}")
+
+    await state.set_stage("reap", StageStatus.RUNNING)
+    await state.set_progress(0)
+    await state.log("Starting REAP expert pruning", "stage")
+
+    svc = ReapService(FOUNDRY_ROOT, VENV_PYTHON)
+    script = svc.build_script(
+        input_dir=str(source_dir.resolve()),
+        output_dir=str(reap_dir.resolve()),
+        cwd_dir=str(out_abs.resolve()),
+        compression_ratio=rc.compression_ratio,
+        prune_method=rc.prune_method,
+        samples_per_category=rc.samples_per_category,
+        model_max_length=rc.model_max_length,
+        dataset_name=rc.dataset_name,
+        seed=rc.seed,
+    )
+    rc_code = await run_script(script, out)
+    ok = rc_code == 0
+    await state.set_stage("reap", StageStatus.COMPLETE if ok else StageStatus.FAILED)
+    if ok:
+        await state.set_progress(100)
+    return ok
+
+
 async def do_magicquant(cfg: RunRequest) -> bool:
     """Run MagicQuant evolutionary search and generate tiered hybrid GGUFs."""
     out = cfg.training.output_dir
@@ -657,6 +772,7 @@ async def do_upload(cfg: RunRequest) -> bool:
         dataset_name=tc.datasets[0] if tc.datasets else "",
         did_training="training" in enabled,
         did_heretic="heretic" in enabled,
+        did_reap="reap" in enabled,
         did_magicquant="magicquant" in enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -684,6 +800,7 @@ STAGE_RUNNERS = {
     "training":   do_training,
     "export":     do_export,
     "heretic":    do_heretic,
+    "reap":       do_reap,
     "magicquant": do_magicquant,
     "upload":     do_upload,
 }
@@ -711,20 +828,38 @@ async def validate_pipeline(cfg: RunRequest) -> bool:
             return False
         await state.log(f"Export skipped -- Heretic will use existing: {out_abs}/merged_model")
 
+    # REAP without export/heretic: needs a merged or abliterated model from prior run
+    if "reap" in enabled and "export" not in enabled and "heretic" not in enabled:
+        has_heretic = (out_abs / "heretic_model").exists()
+        has_merged = (out_abs / "merged_model").exists()
+        if not has_heretic and not has_merged:
+            await state.log("REAP is enabled without Export or Heretic, and no merged or abliterated "
+                            "model was found in the output directory. Enable an upstream stage or run "
+                            "a pipeline to produce a safetensors model first.", "error")
+            return False
+        target = "heretic_model" if has_heretic else "merged_model"
+        await state.log(f"Upstream stages skipped — REAP will use existing: {out_abs}/{target}")
+
     # MagicQuant without export: needs a source
     if "magicquant" in enabled and "export" not in enabled:
         mc = cfg.magicquant
         source = mc.source_model if mc else ""
         # Check if prior pipeline output exists
+        has_reap = (out_abs / "reap_model").exists()
+        has_heretic = (out_abs / "heretic_model").exists()
         has_merged = (out_abs / "merged_model").exists()
         has_gguf = (out_abs / "model-bf16.gguf").exists()
-        if not source and not has_merged and not has_gguf:
+        if not source and not has_reap and not has_heretic and not has_merged and not has_gguf:
             await state.log("MagicQuant is enabled without Export, and no existing model artifacts "
                             "were found in the output directory. Set a Source Model path in MagicQuant "
                             "config, or enable Export.", "error")
             return False
         if source:
             await state.log(f"Export skipped — MagicQuant will use source: {source}")
+        elif has_reap:
+            await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/reap_model")
+        elif has_heretic:
+            await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/heretic_model")
         elif has_merged:
             await state.log(f"Export skipped — MagicQuant will use existing: {out_abs}/merged_model")
         else:

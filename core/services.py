@@ -575,6 +575,154 @@ class HereticService:
         return script
 
 
+class ReapService:
+    """Orchestrates the REAP expert pruning subprocess.
+
+    REAP (Router-weighted Expert Activation Pruning) prunes experts from MoE
+    models. Its own pyproject.toml pins torch==2.7.1 / transformers==4.55.0 /
+    vllm==0.10.0, which would break Foundry's ROCm stack. So we import
+    ``reap.prune`` by adding its ``src/`` to ``sys.path`` and stubbing every
+    heavy optional dependency (vllm, lm_eval, evalplus, lcb_runner, crfm_helm,
+    evalscope, uvloop, deepspeed, wandb) at subprocess startup.
+
+    REAP writes its output to a path like
+    ``artifacts/<model>/<dataset>/pruned_models/<method>-seed_<seed>-<ratio>/``
+    relative to cwd. We chdir into the Foundry output directory so that
+    relative path lands inside the run, then move the pruned model into
+    ``<output_dir>/reap_model/``.
+    """
+
+    def __init__(self, pipeline_root: Path, venv_python: str) -> None:
+        self.pipeline_root = pipeline_root
+        self.venv_python = venv_python
+
+    def build_script(
+        self,
+        *,
+        input_dir: str,     # heretic_model or merged_model path (absolute)
+        output_dir: str,    # absolute path where reap_model should end up
+        cwd_dir: str,       # working directory for REAP's relative artifact paths
+        compression_ratio: float,
+        prune_method: str,
+        samples_per_category: int,
+        model_max_length: int,
+        dataset_name: str,
+        seed: int,
+    ) -> str:
+        """Generate the REAP pruning subprocess script text."""
+        script = (
+            "import os, sys, shutil\n"
+            'os.environ["HSA_ENABLE_SDMA"] = "0"\n'
+            'os.environ["PYTORCH_HIP_ALLOC_CONF"] = '
+            '"backend:native,expandable_segments:True"\n'
+            'os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"\n'
+            "\n"
+            "# ── Stub out heavy optional REAP dependencies ──\n"
+            "import types, importlib.machinery\n"
+            "\n"
+            "def _stub(name):\n"
+            "    m = types.ModuleType(name)\n"
+            "    m.__spec__ = importlib.machinery.ModuleSpec(name, None)\n"
+            "    sys.modules[name] = m\n"
+            "    return m\n"
+            "\n"
+            "for _name in ['vllm', 'vllm.entrypoints', 'vllm.entrypoints.openai',\n"
+            "              'vllm.entrypoints.openai.api_server', 'vllm.engine',\n"
+            "              'vllm.engine.arg_utils', 'vllm.model_executor',\n"
+            "              'vllm.model_executor.models', 'lm_eval', 'lm_eval.utils',\n"
+            "              'evalplus', 'evalplus.evaluate', 'lcb_runner', 'lcb_runner.runner',\n"
+            "              'lcb_runner.runner.main', 'crfm_helm', 'evalscope', 'uvloop',\n"
+            "              'deepspeed', 'wandb']:\n"
+            "    _stub(_name)\n"
+            "\n"
+            "sys.modules['vllm'].TokensPrompt = type('TokensPrompt', (), {})\n"
+            "sys.modules['vllm.entrypoints.openai.api_server'].run_server = lambda *a, **k: None\n"
+            "sys.modules['vllm.engine.arg_utils'].AsyncEngineArgs = type('AsyncEngineArgs', (), {})\n"
+            "sys.modules['vllm.model_executor.models'].ModelRegistry = type('ModelRegistry', (), {})\n"
+            "sys.modules['lm_eval'].evaluator = type('evaluator', (), {})\n"
+            "sys.modules['lm_eval.utils'].make_table = lambda *a, **k: None\n"
+            "sys.modules['evalplus.evaluate'].evaluate = lambda *a, **k: None\n"
+            "\n"
+            "sys.path.insert(0, '/server/programming/reap/src')\n"
+            "\n"
+            "from pathlib import Path\n"
+            "\n"
+            f"_source = {repr(input_dir)}\n"
+            f"_cwd = {repr(cwd_dir)}\n"
+            f"_reap_dir = {repr(output_dir)}\n"
+            "\n"
+            "print(f'[reap] source: {_source}')\n"
+            "print(f'[reap] cwd: {_cwd}')\n"
+            "print(f'[reap] final dest: {_reap_dir}')\n"
+            "\n"
+            "# REAP writes to a relative ./artifacts/<model>/<dataset>/pruned_models/<name>/\n"
+            "# path. Chdir into cwd_dir so that relative path lands inside the Foundry run.\n"
+            "os.makedirs(_cwd, exist_ok=True)\n"
+            "os.chdir(_cwd)\n"
+            "\n"
+            "# Clear stale reap artifacts dir from a previous run so we can reliably\n"
+            "# locate the new pruned_models/ output after main() finishes.\n"
+            "_artifacts_root = Path(_cwd) / 'artifacts'\n"
+            "if _artifacts_root.exists():\n"
+            "    print(f'[reap] removing stale artifacts dir: {_artifacts_root}')\n"
+            "    shutil.rmtree(_artifacts_root, ignore_errors=True)\n"
+            "\n"
+            "# Inject CLI args as if running `python -m reap.prune`.\n"
+            "sys.argv = [\n"
+            "    'reap-prune',\n"
+            "    '--model-name', _source,\n"
+            f"    '--compression-ratio', {repr(str(compression_ratio))},\n"
+            f"    '--prune-method', {repr(prune_method)},\n"
+            f"    '--samples_per_category', {repr(str(samples_per_category))},\n"
+            f"    '--model_max_length', {repr(str(model_max_length))},\n"
+            f"    '--seed', {repr(str(seed))},\n"
+            f"    '--dataset-name', {repr(dataset_name)},\n"
+            "    '--do-eval', 'false',\n"
+            "    '--profile', 'false',\n"
+            "    '--smoke_test', 'false',\n"
+            "    '--record_pruning_metrics_only', 'true',\n"
+            "    '--overwrite_observations', 'false',\n"
+            "    '--plot_clusters', 'false',\n"
+            "]\n"
+            "\n"
+            "print(f'[reap] invoking reap.prune.main() with argv: {sys.argv[1:]}')\n"
+            "from reap.prune import main as _reap_main\n"
+            "_reap_main()\n"
+            "\n"
+            "# Locate the pruned_models/<something>/ directory that REAP just wrote.\n"
+            "print(f'[reap] searching for pruned model under {_artifacts_root}')\n"
+            "_candidates = list(_artifacts_root.rglob('pruned_models/*'))\n"
+            "_pruned = [c for c in _candidates if c.is_dir() and any(c.glob('*.safetensors'))]\n"
+            "if not _pruned:\n"
+            "    print(f'[reap] ERROR: no pruned model directory with safetensors found under {_artifacts_root}')\n"
+            "    for _p in sorted(_artifacts_root.rglob('*'))[:50]:\n"
+            "        print(f'  {_p}')\n"
+            "    sys.exit(1)\n"
+            "\n"
+            "_pruned.sort(key=lambda p: p.stat().st_mtime, reverse=True)\n"
+            "_src = _pruned[0]\n"
+            "print(f'[reap] pruned model at: {_src}')\n"
+            "\n"
+            "# Move the pruned output into reap_dir.\n"
+            "_dest = Path(_reap_dir)\n"
+            "if _dest.exists():\n"
+            "    shutil.rmtree(_dest)\n"
+            "_dest.parent.mkdir(parents=True, exist_ok=True)\n"
+            "shutil.move(str(_src), str(_dest))\n"
+            "print(f'[reap] moved pruned model to: {_dest}')\n"
+            "\n"
+            "# Cleanup: remove the now-empty artifacts/ tree.\n"
+            "try:\n"
+            "    shutil.rmtree(_artifacts_root)\n"
+            "    print(f'[reap] cleaned up {_artifacts_root}')\n"
+            "except Exception as _e:\n"
+            "    print(f'[reap] warning: cleanup of {_artifacts_root} failed: {_e}')\n"
+            "\n"
+            "print('PIPELINE_STAGE_COMPLETE=reap')\n"
+        )
+        return script
+
+
 class MagicQuantService:
     """Orchestrates the MagicQuant evolutionary search subprocess."""
 
@@ -661,6 +809,10 @@ class MagicQuantService:
             f"        candidates = [out_dir]\n"
             f"    for c in candidates:\n"
             f"        if c.is_dir():\n"
+            f'            reap = c / "reap_model"\n'
+            f"            if reap.exists() and "
+            f'any(reap.glob("*.safetensors")):\n'
+            f"                return str(reap)\n"
             f'            heretic = c / "heretic_model"\n'
             f"            if heretic.exists() and "
             f'any(heretic.glob("*.safetensors")):\n'
@@ -744,6 +896,7 @@ class UploadService:
         dataset_name: str,
         did_training: bool = True,
         did_heretic: bool = False,
+        did_reap: bool = False,
         did_magicquant: bool = True,
         lora_r: int,
         lora_alpha: int,
@@ -775,6 +928,7 @@ class UploadService:
             f"    dataset_name={repr(dataset_name)},\n"
             f"    did_training={did_training},\n"
             f"    did_heretic={did_heretic},\n"
+            f"    did_reap={did_reap},\n"
             f"    did_magicquant={did_magicquant},\n"
             f"    lora_r={lora_r},\n"
             f"    lora_alpha={lora_alpha},\n"

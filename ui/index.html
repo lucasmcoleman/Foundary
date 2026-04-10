@@ -407,6 +407,14 @@ html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-f
           <label class="toggle"><input type="checkbox" onchange="toggleStage('heretic',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
         </div>
       </div>
+      <div class="stage-item" data-stage="reap" data-status="pending" onclick="selectStage('reap')">
+        <div class="stage-indicator"></div>
+        <div class="stage-name">REAP</div>
+        <div class="stage-desc">Expert pruning (MoE only)</div>
+        <div class="stage-toggle" onclick="event.stopPropagation()">
+          <label class="toggle"><input type="checkbox" onchange="toggleStage('reap',this.checked)"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+      </div>
       <div class="stage-item" data-stage="magicquant" data-status="pending" onclick="selectStage('magicquant')">
         <div class="stage-indicator"></div>
         <div class="stage-name">MagicQuant</div>
@@ -577,6 +585,7 @@ const S = {
     },
     export: { gguf_type: 'bf16', also_save_merged: false, source_model: '' },
     heretic: { n_trials: 200, n_startup_trials: 60, quantization: 'bnb_4bit', kl_divergence_scale: 1.0, orthogonalize_direction: false, row_normalization: 'none' },
+    reap: { compression_ratio: 0.25, prune_method: 'reap', samples_per_category: 512, model_max_length: 2048, dataset_name: 'theblackcat102/evol-codealpaca-v1', seed: 42 },
     magicquant: { target_base_quant: 'MXFP4_MOE', generations: 50, population_size: 100, tiers: ['Q4','Q5','Q6'], llamacpp_path: '', source_model: '' },
     upload: { repo_id: '', private: true, license: '', upload_gguf: true, upload_lora: false, upload_merged: false, upload_dataset: true },
   },
@@ -725,12 +734,13 @@ async function saveCurrentWorkflow() {
     showStatus('Invalid name. Use letters, numbers, hyphens, underscores only.', 'error');
     return;
   }
-  const stageOrder = ['training', 'export', 'heretic', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   const payload = {
     training: S.config.training,
     export: S.config.export,
     heretic: S.config.heretic,
+    reap: S.config.reap,
     magicquant: S.config.magicquant,
     upload: S.config.upload,
     enabled_stages: enabled,
@@ -789,7 +799,7 @@ function applyWorkflow(data) {
   }
   // Restore enabled stages (ignore unknown stages from old saves)
   if (data.enabled_stages) {
-    const validStages = new Set(['training', 'export', 'heretic', 'magicquant', 'upload']);
+    const validStages = new Set(['training', 'export', 'heretic', 'reap', 'magicquant', 'upload']);
     S.enabledStages = new Set(data.enabled_stages.filter(s => validStages.has(s)));
   }
   // Sync sidebar toggles
@@ -945,7 +955,7 @@ function toggleStage(name, on) {
  * Binds data-key inputs to S.config and persists changes to localStorage.
  */
 function renderStageContent() {
-  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, magicquant: renderMagicQuant, upload: renderUpload};
+  const r = {training: renderTraining, export: renderExport, heretic: renderHeretic, reap: renderReap, magicquant: renderMagicQuant, upload: renderUpload};
   const container = document.getElementById('stage-content');
   if (!container) return;
   container.innerHTML = (r[S.selectedStage] || (() => ''))();
@@ -1015,6 +1025,7 @@ function suggestRepoId() {
   const trainingOn = stages.has('training');
   const exportOn = stages.has('export');
   const hasHeretic = stages.has('heretic');
+  const hasReap = stages.has('reap');
   const hasMQ = stages.has('magicquant');
 
   // Resolve the base model name from the first available source
@@ -1064,6 +1075,7 @@ function suggestRepoId() {
   // Build suffix from active post-training stages
   const parts = [];
   if (hasHeretic) parts.push('Heretic-Uncensored');
+  if (hasReap) parts.push('Pruned');
   if (hasMQ) parts.push('GGUF');
   else if (exportOn) parts.push('GGUF');
   else parts.push('LoRA');
@@ -1204,6 +1216,39 @@ function renderHeretic() {
   </div>`;
 }
 
+/** @returns {string} HTML for the REAP (expert pruning) configuration panel. */
+function renderReap() {
+  const c = S.config.reap;
+  const on = S.enabledStages.has('reap');
+  const exportOn = S.enabledStages.has('export');
+  const hereticOn = S.enabledStages.has('heretic');
+  const hasUpstream = exportOn || hereticOn;
+  return `
+  <div class="section-header"><div class="section-title">REAP Pruning</div><div class="section-badge badge-optional">Optional</div></div>
+  ${masterToggle('reap', 'REAP Stage')}
+  <div class="${on?'':'stage-content-disabled'}">
+  ${!hasUpstream ? depBanner('warn', 'No upstream stage (Export or Heretic) is enabled. REAP requires a merged or abliterated safetensors model. If artifacts from a previous run exist in the output directory they will be used automatically.') : ''}
+  ${depBanner('info', '<strong>Mixture-of-Experts models only.</strong> REAP (Router-weighted Expert Activation Pruning) removes a fraction of experts per MoE layer based on activation-weighted saliency. Supported architectures: Qwen3 MoE, Mixtral, Llama 4, DeepSeek V2, Ernie 4.5 MoE, GLM 4 MoE, gpt-oss-20b. Dense models and unsupported MoE variants are skipped automatically.')}
+  <div style="padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-1);margin-bottom:20px;">REAP runs a calibration pass over a code dataset, records router decisions and expert activations, then drops the lowest-ranked experts in each MoE layer. The router is trimmed accordingly. Output is a smaller HF safetensors model that feeds MagicQuant.</div>
+  <div class="form-grid">
+    <div class="form-group">${L('Compression Ratio','Fraction of experts to remove per layer. 0.25 keeps 75% of experts, 0.5 keeps half. Typical range 0.1-0.5.')}<input class="form-input" type="number" min="0.05" max="0.75" step="0.05" data-key="reap.compression_ratio" value="${c.compression_ratio}"></div>
+    <div class="form-group">${L('Prune Method','Saliency metric used to rank experts. reap = the default router-weighted activation norm method. Other options are historical comparisons from the paper.')}<select class="form-input" data-key="reap.prune_method">
+      <option value="reap" ${c.prune_method==='reap'?'selected':''}>reap (default)</option>
+      <option value="frequency" ${c.prune_method==='frequency'?'selected':''}>frequency</option>
+      <option value="ean_sum" ${c.prune_method==='ean_sum'?'selected':''}>ean_sum</option>
+      <option value="ean_ca" ${c.prune_method==='ean_ca'?'selected':''}>ean_ca</option>
+      <option value="ean_mean" ${c.prune_method==='ean_mean'?'selected':''}>ean_mean</option>
+      <option value="max_activations" ${c.prune_method==='max_activations'?'selected':''}>max_activations</option>
+    </select></div>
+    <div class="form-group">${L('Samples per Category','Calibration samples drawn from the dataset per category. More = better activation statistics but slower. 256-1024 typical.')}<input class="form-input" type="number" data-key="reap.samples_per_category" value="${c.samples_per_category}"></div>
+    <div class="form-group">${L('Model Max Length','Max tokens per calibration sample. Longer = richer context but higher VRAM. Should not exceed the model context window.')}<input class="form-input" type="number" data-key="reap.model_max_length" value="${c.model_max_length}"></div>
+    <div class="form-group span-2">${L('Calibration Dataset','HuggingFace dataset used for calibration. Default is a coding dataset. Choose one that matches your target domain for best results.')}<input class="form-input" data-key="reap.dataset_name" value="${c.dataset_name}"></div>
+    <div class="form-group">${L('Seed','Random seed for dataset sampling and reproducibility.')}<input class="form-input" type="number" data-key="reap.seed" value="${c.seed}"></div>
+  </div>
+  <div class="progress-container" id="progress"><div class="progress-header"><span class="progress-stage">REAP</span><span class="progress-pct">0%</span></div><div class="progress-bar"><div class="progress-fill"></div></div></div>
+  </div>`;
+}
+
 /** @returns {string} HTML for the MagicQuant configuration panel. */
 function renderMagicQuant() {
   const c = S.config.magicquant;
@@ -1317,7 +1362,7 @@ function toggleAutoScroll() {
 async function runPipeline() {
   if (S.running) return;
   dismissStatus();
-  const stageOrder = ['training', 'export', 'heretic', 'magicquant', 'upload'];
+  const stageOrder = ['training', 'export', 'heretic', 'reap', 'magicquant', 'upload'];
   const enabled = stageOrder.filter(s => S.enabledStages.has(s));
   if (enabled.length === 0) {
     showStatus('Enable at least one stage before running.', 'error');
@@ -1331,6 +1376,7 @@ async function runPipeline() {
     training: S.config.training,
     export: S.config.export,
     heretic: S.config.heretic,
+    reap: S.config.reap,
     magicquant: S.config.magicquant,
     upload: S.config.upload,
     enabled_stages: enabled,

@@ -72,6 +72,25 @@ class HereticConfig:
 
 
 @dataclass
+class ReapConfig:
+    """REAP expert pruning (MoE models only).
+
+    Router-weighted Expert Activation Pruning. Removes a fraction of experts
+    from each MoE layer based on activation-informed saliency metrics.
+    Cerebras Research's tool — https://github.com/CerebrasResearch/reap
+
+    Only supported for specific MoE architectures listed in reap.model_util.
+    Dense models and unsupported MoE variants will skip this stage.
+    """
+    compression_ratio: float = 0.25  # Fraction of experts to remove per layer
+    prune_method: str = "reap"  # reap, frequency, ean_sum, max_activations, etc.
+    samples_per_category: int = 512  # Calibration samples
+    model_max_length: int = 2048  # Max tokens per calibration sample
+    dataset_name: str = "theblackcat102/evol-codealpaca-v1"  # Calibration dataset
+    seed: int = 42
+
+
+@dataclass
 class MagicQuantConfig:
     target_base_quant: str = "MXFP4_MOE"
     generations: int = 50
@@ -122,6 +141,7 @@ class PipelineConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     export: Optional[ExportConfig] = field(default_factory=ExportConfig)
     heretic: Optional[HereticConfig] = None
+    reap: Optional[ReapConfig] = None
     magicquant: Optional[MagicQuantConfig] = field(default_factory=MagicQuantConfig)
     upload: Optional[UploadConfig] = None
 
@@ -148,6 +168,10 @@ class Artifacts:
     @property
     def heretic_dir(self) -> Path:
         return self.output_dir / "heretic_model"
+
+    @property
+    def reap_dir(self) -> Path:
+        return self.output_dir / "reap_model"
 
     @property
     def magicquant_dir(self) -> Path:
@@ -941,6 +965,222 @@ _real_print("PIPELINE_STAGE_COMPLETE=heretic")
     return True
 
 
+# ── Stage: REAP (expert pruning) ─────────────────────────────────────────────
+#
+# Router-weighted Expert Activation Pruning for MoE models.
+# Only supports the specific architectures in reap.model_util.MODEL_ATTRS.
+# Unsupported architectures (dense models, Granite MoE, etc.) are skipped
+# silently with a warning so the rest of the pipeline can continue.
+
+# Architectures supported by reap.model_util.MODEL_ATTRS (mirrors that dict).
+REAP_SUPPORTED_ARCHS = {
+    "Qwen3MoeForCausalLM",
+    "Qwen3-Coder-30B-A3B-Instruct",
+    "NonUniformQwen3MoeForCausalLM",
+    "Llama4ForCausalLM",
+    "MixtralForCausalLM",
+    "DeepseekV2ForCausalLM",
+    "Ernie4_5_MoEForCausalLM",
+    "Ernie4_5_MoeForCausalLM",
+    "gpt-oss-20b",
+    "Glm4MoeForCausalLM",
+}
+
+
+def _detect_model_arch(model_path: Path) -> Optional[str]:
+    """Read config.json and return the first entry in architectures list, or None."""
+    cfg_path = model_path / "config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        archs = cfg.get("architectures") or []
+        if archs and isinstance(archs, list):
+            return archs[0]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def stage_reap(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
+    """Run REAP expert pruning on the merged or abliterated model.
+
+    Reads from ``heretic_dir`` (preferred) or ``merged_dir`` and writes to
+    ``reap_dir``. Silently skips (returns True) when the model architecture
+    is not supported by REAP.
+    """
+    log("Starting REAP expert pruning", "stage")
+
+    # Determine source: prefer heretic output, fall back to merged safetensors
+    if artifacts.heretic_dir.exists() and any(artifacts.heretic_dir.glob("*.safetensors")):
+        source_path = artifacts.heretic_dir
+        log(f"Source: abliterated model at {source_path}")
+    elif artifacts.merged_dir.exists() and any(artifacts.merged_dir.glob("*.safetensors")):
+        source_path = artifacts.merged_dir
+        log(f"Source: merged safetensors at {source_path}")
+    else:
+        log("No merged or abliterated model found — run export first", "error")
+        return False
+
+    # Skip if REAP output already exists.
+    if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
+        log(f"REAP output already exists at {artifacts.reap_dir} — skipping", "success")
+        return True
+
+    # Check architecture support before launching a subprocess.
+    arch = _detect_model_arch(source_path)
+    if arch is None:
+        log(f"Could not detect model architecture from {source_path}/config.json — skipping REAP", "warn")
+        return True
+    if arch not in REAP_SUPPORTED_ARCHS:
+        log(f"Architecture '{arch}' is not supported by REAP — skipping stage", "warn")
+        log(f"  REAP supports: {sorted(REAP_SUPPORTED_ARCHS)}")
+        return True
+    log(f"Detected supported architecture: {arch}")
+
+    rc = config.reap
+    output_dir = artifacts.output_dir.resolve()
+    source_abs = source_path.resolve()
+    reap_dir_abs = artifacts.reap_dir.resolve()
+
+    # Use the directory containing this file as the project root (not CWD).
+    _project_root = Path(__file__).resolve().parent.parent
+
+    # Generate a subprocess script. This uses the verified stub block to
+    # avoid importing vllm / lm_eval / evalplus / etc. whose pinned versions
+    # would break Foundry's ROCm torch stack if actually installed. We only
+    # exercise reap.prune, which does not need those runtime deps.
+    script = f'''
+import os, sys, shutil
+os.environ["HSA_ENABLE_SDMA"] = "0"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "backend:native,expandable_segments:True"
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
+# ── Stub out heavy optional REAP dependencies ──
+import types, importlib.machinery
+
+def _stub(name):
+    m = types.ModuleType(name)
+    m.__spec__ = importlib.machinery.ModuleSpec(name, None)
+    sys.modules[name] = m
+    return m
+
+for _name in ['vllm', 'vllm.entrypoints', 'vllm.entrypoints.openai',
+              'vllm.entrypoints.openai.api_server', 'vllm.engine',
+              'vllm.engine.arg_utils', 'vllm.model_executor',
+              'vllm.model_executor.models', 'lm_eval', 'lm_eval.utils',
+              'evalplus', 'evalplus.evaluate', 'lcb_runner', 'lcb_runner.runner',
+              'lcb_runner.runner.main', 'crfm_helm', 'evalscope', 'uvloop',
+              'deepspeed', 'wandb']:
+    _stub(_name)
+
+sys.modules['vllm'].TokensPrompt = type('TokensPrompt', (), {{}})
+sys.modules['vllm.entrypoints.openai.api_server'].run_server = lambda *a, **k: None
+sys.modules['vllm.engine.arg_utils'].AsyncEngineArgs = type('AsyncEngineArgs', (), {{}})
+sys.modules['vllm.model_executor.models'].ModelRegistry = type('ModelRegistry', (), {{}})
+sys.modules['lm_eval'].evaluator = type('evaluator', (), {{}})
+sys.modules['lm_eval.utils'].make_table = lambda *a, **k: None
+sys.modules['evalplus.evaluate'].evaluate = lambda *a, **k: None
+
+sys.path.insert(0, '/server/programming/reap/src')
+
+from pathlib import Path
+
+_source = {str(source_abs)!r}
+_output_dir = {str(output_dir)!r}
+_reap_dir = {str(reap_dir_abs)!r}
+
+print(f"[reap] source: {{_source}}")
+print(f"[reap] output_dir (cwd): {{_output_dir}}")
+print(f"[reap] final dest: {{_reap_dir}}")
+
+# REAP writes to a relative ./artifacts/<model>/<dataset>/pruned_models/<name>/
+# path. We chdir into output_dir so that relative path lands inside our run.
+os.makedirs(_output_dir, exist_ok=True)
+os.chdir(_output_dir)
+
+# Clear any stale reap artifacts directory from a previous run so we can
+# reliably locate the new pruned_models/ output after main() finishes.
+_artifacts_root = Path(_output_dir) / 'artifacts'
+if _artifacts_root.exists():
+    print(f"[reap] removing stale artifacts dir: {{_artifacts_root}}")
+    shutil.rmtree(_artifacts_root, ignore_errors=True)
+
+# Inject CLI args as if running `python -m reap.prune`.
+sys.argv = [
+    'reap-prune',
+    '--model-name', _source,
+    '--compression-ratio', {str(rc.compression_ratio)!r},
+    '--prune-method', {rc.prune_method!r},
+    '--samples_per_category', {str(rc.samples_per_category)!r},
+    '--model_max_length', {str(rc.model_max_length)!r},
+    '--seed', {str(rc.seed)!r},
+    '--dataset-name', {rc.dataset_name!r},
+    '--do-eval', 'false',
+    '--profile', 'false',
+    '--smoke_test', 'false',
+    '--record_pruning_metrics_only', 'true',
+    '--overwrite_observations', 'false',
+    '--plot_clusters', 'false',
+]
+
+print(f"[reap] invoking reap.prune.main() with argv: {{sys.argv[1:]}}")
+from reap.prune import main as _reap_main
+_reap_main()
+
+# Locate the pruned_models/<something>/ directory that REAP just wrote.
+print(f"[reap] searching for pruned model under {{_artifacts_root}}")
+_candidates = list(_artifacts_root.rglob('pruned_models/*'))
+_pruned = [c for c in _candidates if c.is_dir() and any(c.glob('*.safetensors'))]
+if not _pruned:
+    print(f"[reap] ERROR: no pruned model directory with safetensors found under {{_artifacts_root}}")
+    # Show what we did find for debugging
+    for _p in sorted(_artifacts_root.rglob('*'))[:50]:
+        print(f"  {{_p}}")
+    sys.exit(1)
+
+# Pick the most-recently-modified candidate (in case of multiple).
+_pruned.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+_src = _pruned[0]
+print(f"[reap] pruned model at: {{_src}}")
+
+# Move into reap_dir. Use os.replace on individual files to handle the case
+# where reap_dir already exists (we checked for stale artifacts, but the
+# parent may still be there).
+_dest = Path(_reap_dir)
+if _dest.exists():
+    shutil.rmtree(_dest)
+_dest.parent.mkdir(parents=True, exist_ok=True)
+shutil.move(str(_src), str(_dest))
+print(f"[reap] moved pruned model to: {{_dest}}")
+
+# Cleanup: remove the now-empty artifacts/ tree so we don't leave junk.
+try:
+    shutil.rmtree(_artifacts_root)
+    print(f"[reap] cleaned up {{_artifacts_root}}")
+except Exception as _e:
+    print(f"[reap] warning: cleanup of {{_artifacts_root}} failed: {{_e}}")
+
+print("PIPELINE_STAGE_COMPLETE=reap")
+'''
+
+    script_path = artifacts.output_dir / "_stage_reap.py"
+    script_path.write_text(script)
+
+    rc_code = _run([_find_python(), "-u", str(script_path)], log, cwd=str(_project_root))
+    if rc_code != 0:
+        log(f"REAP failed (exit code {rc_code})", "error")
+        return False
+
+    if not artifacts.reap_dir.exists():
+        log("REAP output directory not found", "error")
+        return False
+
+    log(f"Pruned model saved to {artifacts.reap_dir}", "success")
+    return True
+
+
 # ── Stage: MagicQuant ────────────────────────────────────────────────────────
 
 def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -> bool:
@@ -950,8 +1190,11 @@ def stage_magicquant(config: PipelineConfig, artifacts: Artifacts, log: LogFn) -
     """
     log("Starting MagicQuant evolutionary quantization", "stage")
 
-    # Determine source: prefer heretic output, then merged safetensors, fall back to GGUF
-    if artifacts.heretic_dir.exists():
+    # Determine source: prefer REAP output, then heretic, then merged, fall back to GGUF
+    if artifacts.reap_dir.exists() and any(artifacts.reap_dir.glob("*.safetensors")):
+        source_path = str(artifacts.reap_dir)
+        log(f"Source: REAP-pruned model at {source_path}")
+    elif artifacts.heretic_dir.exists():
         source_path = str(artifacts.heretic_dir)
         log(f"Source: abliterated model at {source_path}")
     elif artifacts.merged_dir.exists():
@@ -1065,6 +1308,7 @@ def stage_upload(config: PipelineConfig, artifacts: Artifacts, log: LogFn,
         dataset_name=tc.dataset_path,
         did_training="training" in _enabled,
         did_heretic="heretic" in _enabled,
+        did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -1111,6 +1355,7 @@ def stage_upload_dry_run(config: PipelineConfig, artifacts: Artifacts, log: LogF
         dataset_name=tc.dataset_path,
         did_training="training" in _enabled,
         did_heretic="heretic" in _enabled,
+        did_reap="reap" in _enabled,
         did_magicquant="magicquant" in _enabled,
         lora_r=tc.lora_r,
         lora_alpha=tc.lora_alpha,
@@ -1133,6 +1378,7 @@ STAGES = [
     ("training",   stage_training),
     ("export",     stage_export),
     ("heretic",    stage_heretic),
+    ("reap",       stage_reap),
     ("magicquant", stage_magicquant),
     ("upload",     stage_upload),
 ]
@@ -1150,6 +1396,8 @@ def run_pipeline(config: PipelineConfig, log: LogFn = _default_log) -> dict[str,
         enabled.add("export")
     if config.heretic is not None:
         enabled.add("heretic")
+    if config.reap is not None:
+        enabled.add("reap")
     if config.magicquant is not None:
         enabled.add("magicquant")
     if config.upload is not None:
@@ -1194,6 +1442,10 @@ if __name__ == "__main__":
     parser.add_argument("--heretic-trials", type=int, default=200, help="Heretic Optuna trials")
     parser.add_argument("--heretic-quantization", type=str, default="bnb_4bit",
                         help="Heretic model quantization (none or bnb_4bit)")
+    parser.add_argument("--reap", action="store_true", help="Enable REAP expert pruning stage (MoE only)")
+    parser.add_argument("--no-reap", action="store_true", help="Disable REAP expert pruning stage")
+    parser.add_argument("--reap-compression-ratio", type=float, default=0.25,
+                        help="REAP compression ratio — fraction of experts to remove per layer")
     parser.add_argument("--no-magicquant", action="store_true")
     parser.add_argument("--upload-to", type=str, help="HF repo ID")
     parser.add_argument("--llamacpp-path", type=str)
@@ -1226,6 +1478,10 @@ if __name__ == "__main__":
         )
     if args.no_heretic:
         cfg.heretic = None
+    if args.reap and not args.no_reap:
+        cfg.reap = ReapConfig(compression_ratio=args.reap_compression_ratio)
+    if args.no_reap:
+        cfg.reap = None
     if args.no_magicquant:
         cfg.magicquant = None
     if args.upload_to:
@@ -1250,6 +1506,8 @@ if __name__ == "__main__":
             _dry_enabled.add("export")
         if cfg.heretic is not None:
             _dry_enabled.add("heretic")
+        if cfg.reap is not None:
+            _dry_enabled.add("reap")
         if cfg.magicquant is not None:
             _dry_enabled.add("magicquant")
         if cfg.upload is not None:
